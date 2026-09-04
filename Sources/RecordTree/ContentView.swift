@@ -337,6 +337,7 @@ struct ContentView: View {
             }
             .buttonStyle(.plain)
             .foregroundColor(.secondary)
+            .focusable(false)
             .help("快捷键设置")
 
             Button(action: openGitHub) {
@@ -345,6 +346,7 @@ struct ContentView: View {
             }
             .buttonStyle(.plain)
             .foregroundColor(.secondary)
+            .focusable(false)
             .help("访问 GitHub 开源仓库")
         }
         .padding(.horizontal, 12)
