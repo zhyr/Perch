@@ -1,0 +1,6 @@
+.build/
+.DS_Store
+*.xcuserstate
+
+# 本地设计/需求文档，不推送开源仓库
+docs/
