@@ -76,6 +76,8 @@ struct ContentView: View {
     @State private var confirmDelete: DeleteRequest?
     /// 新建记录编辑器：存在未保存内容时离开需确认丢弃
     @State private var discardNewDraft = false
+    /// 底部日期跳转目录
+    @State private var showDayJump = false
 
     // 悬停浮层（全局坐标）
     @State private var hoverTreeFrame: CGRect?
@@ -88,6 +90,11 @@ struct ContentView: View {
     // 右下角拖拽缩放
     @State private var resizeStartFrame: NSRect?
     @State private var resizeStartPoint: NSPoint?
+
+    // 列表键盘导航：↑/↓ 选择行，回车复制整棵，空格展开/折叠，x 归档，⌫ 删除
+    @State private var keyboardFocusedTreeID: String?
+    @State private var keyboardMonitor: Any?
+    @State private var windowResignObserver: NSObjectProtocol?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -152,6 +159,12 @@ struct ContentView: View {
                     .transition(.opacity)
             }
         }
+        .overlay {
+            if showDayJump, model.viewMode == .list {
+                dayJumpLayer
+                    .transition(.opacity)
+            }
+        }
         .onChange(of: model.scrollInProgress) { scrolling in
             // 开始滚动即清除旧悬停位，避免滚动结束后残留高亮/预览导致视觉跳变
             guard scrolling else { return }
@@ -161,9 +174,16 @@ struct ContentView: View {
             hoverChunkFrame = nil
             cancelHoverPreview()
         }
+        .onAppear(perform: installKeyboardMonitor)
+        .onDisappear(perform: removeKeyboardMonitor)
+        .onChange(of: model.viewMode) { _ in
+            keyboardFocusedTreeID = nil
+            showDayJump = false
+        }
         .animation(.easeOut(duration: 0.15), value: confirmDelete != nil)
         .animation(.easeInOut(duration: 0.18), value: model.lastToast)
         .animation(.easeOut(duration: 0.1), value: hoverPreviewReady)
+        .animation(.easeOut(duration: 0.15), value: showDayJump)
     }
 
     // MARK: - 删除确认（自定义左对齐弹层，替代系统 alert，保证与整体布局一致）
@@ -180,6 +200,105 @@ struct ContentView: View {
                 )
             }
         }
+    }
+
+    // MARK: - 日期跳转目录
+
+    private var dayJumpLayer: some View {
+        ZStack {
+            Color.black.opacity(0.10)
+                .onTapGesture { showDayJump = false }
+
+            VStack(spacing: 0) {
+                HStack(spacing: 6) {
+                    Image(systemName: "calendar")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundColor(.accentColor)
+                    Text("跳转到有记录的日期")
+                        .font(.system(size: 14, weight: .semibold))
+                    Spacer(minLength: 0)
+                    Button("关闭", action: { showDayJump = false })
+                        .keyboardShortcut(.cancelAction)
+                        .controlSize(.small)
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+
+                Divider()
+
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 2) {
+                        if model.hasNewer {
+                            dayJumpRow(
+                                icon: "bolt.fill",
+                                title: "最新记录",
+                                detail: "当前正停留在更早的日期",
+                                isCurrent: false
+                            ) {
+                                model.goToNewestPage()
+                                showDayJump = false
+                            }
+                        }
+                        ForEach(model.dayJumpItems) { item in
+                            dayJumpRow(
+                                icon: "doc.text",
+                                title: item.label,
+                                detail: "\(item.count) 条"
+                                    + (item.pageCount > 1 ? " · 共 \(item.pageCount) 屏" : ""),
+                                isCurrent: item.dayKey == model.currentDayKey
+                            ) {
+                                model.jumpToDay(item.dayKey)
+                                showDayJump = false
+                            }
+                        }
+                    }
+                    .padding(6)
+                }
+                .frame(maxHeight: 280)
+            }
+            .frame(width: 300, alignment: .leading)
+            .background(Color(nsColor: .controlBackgroundColor))
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .stroke(Color.secondary.opacity(0.2), lineWidth: 0.5)
+            )
+            .shadow(color: Color.black.opacity(0.2), radius: 18, x: 0, y: 8)
+            .transition(.scale(scale: 0.97).combined(with: .opacity))
+        }
+    }
+
+    private func dayJumpRow(
+        icon: String,
+        title: String,
+        detail: String,
+        isCurrent: Bool,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            HStack(spacing: 8) {
+                Image(systemName: isCurrent ? "checkmark.circle.fill" : icon)
+                    .font(.system(size: 12))
+                    .foregroundColor(isCurrent ? Color.accentColor : Color.secondary)
+                    .frame(width: 16)
+                Text(title)
+                    .font(.system(size: 13, weight: isCurrent ? .semibold : .regular))
+                    .foregroundColor(isCurrent ? Color.accentColor : Color.primary)
+                Spacer(minLength: 8)
+                Text(detail)
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
+            .contentShape(Rectangle())
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(isCurrent ? Color.accentColor.opacity(0.08) : Color.clear)
+            )
+        }
+        .buttonStyle(.plain)
     }
 
     // MARK: - 新建记录：丢弃草稿确认
@@ -359,6 +478,173 @@ struct ContentView: View {
             }
     }
 
+    // MARK: - 列表键盘导航
+
+    /// 当前第一响应者是否为文本编辑控件（TextField/TextEditor 编辑态均为 NSTextView），
+    /// 是则把按键交还输入，避免在搜索/编辑/补充分段时误触发列表快捷键。
+    private func isTypingInList() -> Bool {
+        guard let fr = NSApp.keyWindow?.firstResponder else { return false }
+        if fr is NSTextView { return true }
+        if let tf = fr as? NSTextField, tf.currentEditor() != nil { return true }
+        return false
+    }
+
+    private func installKeyboardMonitor() {
+        removeKeyboardMonitor()
+        keyboardMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [self] event in
+            self.handleListKeyEvent(event) ? nil : event
+        }
+        // 面板失去键盘焦点（点击他处 / Esc 隐藏）时收起轻量浮层，避免再次打开时残留
+        windowResignObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didResignKeyNotification,
+            object: nil,
+            queue: .main
+        ) { [self] note in
+            guard let win = note.object as? NSWindow,
+                  win.level == .floating || win.level == .normal
+            else { return }
+            self.showDayJump = false
+        }
+    }
+
+    private func removeKeyboardMonitor() {
+        if let m = keyboardMonitor {
+            NSEvent.removeMonitor(m)
+            keyboardMonitor = nil
+        }
+        if let o = windowResignObserver {
+            NotificationCenter.default.removeObserver(o)
+            windowResignObserver = nil
+        }
+    }
+
+    /// 列表页键盘操作：↑/↓（或 J/K）移动选择行；回车复制整棵；空格展开/折叠；
+    /// X 切换归档；⌫ 删除（仍走二次确认）。返回 true 表示已消费该按键。
+    private func handleListKeyEvent(_ event: NSEvent) -> Bool {
+        guard model.viewMode == .list,
+              confirmDelete == nil,
+              !discardNewDraft,
+              !showDayJump,
+              !isTypingInList(),
+              !model.rows.isEmpty
+        else { return false }
+
+        // 排除带 Command / Control / Option 的组合键，不劫持系统与全局快捷键
+        guard event.modifierFlags.intersection([.command, .control, .option]).isEmpty else {
+            return false
+        }
+
+        let focusedID = keyboardFocusedTreeID
+        switch event.keyCode {
+        case 125: // ↓
+            moveKeyboardSelection(+1)
+            return true
+        case 126: // ↑
+            moveKeyboardSelection(-1)
+            return true
+        case 36: // 回车：复制整棵
+            if let id = focusedID {
+                model.copyTree(id)
+                return true
+            }
+            return false
+        case 49: // 空格：展开 / 折叠（需先有选择行，避免误触整页展开）
+            if let id = focusedID {
+                withAnimation(.easeInOut(duration: 0.16)) {
+                    model.toggleExpanded(id)
+                }
+                return true
+            }
+            return false
+        case 51, 117: // ⌫ / 向前删除
+            deleteFocusedTree()
+            return true
+        default:
+            break
+        }
+
+        if let ch = event.charactersIgnoringModifiers?.lowercased() {
+            switch ch {
+            case "j":
+                moveKeyboardSelection(+1)
+                return true
+            case "k":
+                moveKeyboardSelection(-1)
+                return true
+            case "x":
+                if let id = focusedID {
+                    model.toggleArchiveTree(id)
+                    return true
+                }
+                return false
+            default:
+                break
+            }
+        }
+        return false
+    }
+
+    /// 相对当前选择行移动一行的键盘焦点；到页首/页尾时自动翻到相邻页并衔接选择行。
+    private func moveKeyboardSelection(_ step: Int) {
+        let rows = model.rows
+        guard !rows.isEmpty else {
+            keyboardFocusedTreeID = nil
+            return
+        }
+        var current = keyboardFocusedTreeID.flatMap { id in
+            rows.firstIndex { $0.id == id }
+        }
+        if current == nil { current = 0 }
+        guard let cur = current else { return }
+
+        let next = cur + step
+        if next < 0 {
+            // 已在本屏最顶（更新方向），继续上移到上一屏的末尾行保持连贯
+            if model.hasNewer {
+                model.goNewer(scroll: false)
+                keyboardFocusedTreeID = model.rows.last?.id
+            } else {
+                keyboardFocusedTreeID = rows.first?.id
+            }
+        } else if next >= rows.count {
+            // 已在本屏最底（更旧方向），继续下移到下一屏的首行
+            if model.hasOlder {
+                model.goOlder(scroll: false)
+                keyboardFocusedTreeID = model.rows.first?.id
+            } else {
+                keyboardFocusedTreeID = rows.last?.id
+            }
+        } else {
+            keyboardFocusedTreeID = rows[next].id
+        }
+        scrollKeyboardFocus()
+    }
+
+    /// 记录鼠标点击行：让键盘选择与鼠标操作保持同一“当前行”（点到的行必然可见，无需滚动）
+    private func markKeyboardFocus(_ treeID: String) {
+        keyboardFocusedTreeID = treeID
+    }
+
+    /// 让 ScrollView 把键盘选择行滚动到可视区顶部（复用列表页 scrollTarget 通道）
+    private func scrollKeyboardFocus() {
+        guard let id = keyboardFocusedTreeID else { return }
+        model.scrollTargetTreeID = id
+    }
+
+    /// 键盘删除当前行（是否二次确认仍由 requestDelete 统一决策）
+    private func deleteFocusedTree() {
+        guard let id = keyboardFocusedTreeID,
+              let row = model.rows.first(where: { $0.id == id }) else { return }
+        requestDelete(
+            DeleteRequest(
+                kind: .tree,
+                treeID: id,
+                chunkID: nil,
+                treeChunkCount: row.tree.chunks.count
+            )
+        )
+    }
+
     // MARK: - 顶部工具栏
 
     private var topToolbar: some View {
@@ -510,16 +796,29 @@ struct ContentView: View {
         let hoverEnabled = !model.scrollInProgress
         return Group {
             if model.rows.isEmpty {
-                VStack(spacing: 8) {
+                VStack(spacing: 12) {
                     Spacer()
                     Image(systemName: "doc.on.clipboard")
                         .font(.system(size: 30))
                         .foregroundColor(.secondary)
                     Text("暂无记录")
                         .font(.title3)
-                    Text("在任何应用中复制内容，会自动按 60 秒窗口归并记录")
+                    Text("在任意应用中复制文字或图片，会自动按 60 秒窗口归并成一条记录；也可以手动新建。")
                         .font(.caption)
                         .foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 24)
+                    Button {
+                        model.showNewRecord()
+                    } label: {
+                        Label("新建一条记录", systemImage: "doc.badge.plus")
+                    }
+                    .controlSize(.small)
+                    Text("快捷键：⌘N 新建 · ⌘F 搜索 · 列表内 ↑↓ 选择 / 回车复制 / 空格展开 / X 归档 / ⌫ 删除")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 20)
                     Spacer()
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -532,19 +831,35 @@ struct ContentView: View {
                                 row: row,
                                 isExpanded: model.expandedTreeID == row.id,
                                 isHovered: hoveredTreeID == row.id,
+                                isKeyboardSelected: keyboardFocusedTreeID == row.id,
                                 hoveredChunkID: hoveredChunkID,
                                 highlightedChunkID: model.highlightedChunkID,
                                 isAddingChunk: chunkDraftTreeID == row.id,
                                 chunkDraft: $chunkDraftText,
                                 onToggle: {
+                                    markKeyboardFocus(row.id)
                                     withAnimation(.easeInOut(duration: 0.16)) {
                                         model.toggleExpanded(row.id)
                                     }
                                 },
-                                onCopyTree: { model.copyTree(row.id) },
-                                onCopyChunk: { model.copyChunk($0) },
-                                onArchive: { model.toggleArchiveTree(row.id) },
+                                onCopyTree: {
+                                    markKeyboardFocus(row.id)
+                                    model.copyTree(row.id)
+                                },
+                                onCopyRecord: {
+                                    markKeyboardFocus(row.id)
+                                    model.copyRecord(row.id)
+                                },
+                                onCopyChunk: { cid in
+                                    markKeyboardFocus(row.id)
+                                    model.copyChunk(cid)
+                                },
+                                onArchive: {
+                                    markKeyboardFocus(row.id)
+                                    model.toggleArchiveTree(row.id)
+                                },
                                 onDeleteTree: {
+                                    markKeyboardFocus(row.id)
                                     requestDelete(
                                         DeleteRequest(
                                             kind: .tree,
@@ -555,6 +870,7 @@ struct ContentView: View {
                                     )
                                 },
                                 onDeleteChunk: { cid in
+                                    markKeyboardFocus(row.id)
                                     requestDelete(
                                         DeleteRequest(
                                             kind: .chunk,
@@ -565,6 +881,7 @@ struct ContentView: View {
                                     )
                                 },
                                 onStartAddChunk: {
+                                    markKeyboardFocus(row.id)
                                     withAnimation(.easeInOut(duration: 0.16)) {
                                         model.toggleExpanded(row.id)
                                     }
@@ -625,17 +942,26 @@ struct ContentView: View {
 
             Spacer(minLength: 4)
 
-            // 点击日期回到最新一屏，避免在深翻页后只能一屏屏点“较新”
+            // 日期中心按钮：展开“日期跳转目录”，在深翻页后也可一键回最新
+            let jumpable = model.dayJumpItems.count > 1
             VStack(spacing: 2) {
                 Text(model.dayTitle).font(.headline)
-                Text(model.hasNewer ? "点击回到最新记录" : model.dayMetaText)
+                Text(jumpable ? "点按跳转日期" : model.dayMetaText)
                     .font(.caption)
-                    .foregroundColor(model.hasNewer ? Color.accentColor : Color.secondary)
+                    .foregroundColor(jumpable ? Color.accentColor : Color.secondary)
             }
             .contentShape(Rectangle())
-            .onTapGesture { model.goToNewestPage() }
-            .help("回到最新记录所在的一屏")
-            .opacity(model.hasNewer ? 1 : 0.55)
+            .onTapGesture {
+                if jumpable {
+                    showDayJump = true
+                } else {
+                    model.goToNewestPage()
+                }
+            }
+            .help(jumpable
+                  ? "打开日期跳转目录（可直达任意日期或回到最新）"
+                  : "回到最新记录所在的一屏")
+            .opacity(jumpable || model.hasNewer ? 1 : 0.55)
 
             Spacer(minLength: 4)
 
@@ -1118,6 +1444,7 @@ private struct TreeRowView: View {
     let row: TreeRowVM
     let isExpanded: Bool
     let isHovered: Bool
+    let isKeyboardSelected: Bool
     let hoveredChunkID: String?
     let highlightedChunkID: String?
     let isAddingChunk: Bool
@@ -1125,6 +1452,7 @@ private struct TreeRowView: View {
     @FocusState private var addChunkFocused: Bool
     let onToggle: () -> Void
     let onCopyTree: () -> Void
+    let onCopyRecord: () -> Void
     let onCopyChunk: (String) -> Void
     let onArchive: () -> Void
     let onDeleteTree: () -> Void
@@ -1134,6 +1462,9 @@ private struct TreeRowView: View {
     let onCancelChunk: () -> Void
     let onHoverChanged: (Bool) -> Void
     let onChunkHover: (String?, Bool) -> Void
+
+    /// 操作按钮仅在 悬停 / 展开 / 键盘选中 时展示，日常浏览保持简洁
+    private var showActions: Bool { isHovered || isExpanded || isKeyboardSelected }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -1147,7 +1478,7 @@ private struct TreeRowView: View {
                 .buttonStyle(.plain)
                 .padding(.top, 4)
 
-                // 左侧主内容：点击整行复制整棵记录
+                // 左侧主内容：单击复制整棵记录（标题 + 全部分段，按时序）
                 VStack(alignment: .leading, spacing: 3) {
                     primaryText
                     Text(row.caption)
@@ -1158,51 +1489,59 @@ private struct TreeRowView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .contentShape(Rectangle())
                 .onTapGesture(perform: onCopyTree)
+                .help("单击复制整棵记录（标题 + 全部分段）；右键可展开 / 归档 / 删除等")
 
-                // 右侧操作按钮：复制整棵 / 删除 / 归档 / 追加
-                HStack(spacing: 8) {
-                    Button(action: onCopyTree) {
-                        Image(systemName: "arrow.triangle.branch")
-                            .font(.system(size: 12, weight: .semibold))
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundColor(.secondary)
-                    .help("复制整棵记录（标题 + 全部分段，按时序）")
+                // 行内操作仅在悬停 / 展开 / 键盘选中时展示，避免日常浏览被按钮占满
+                if showActions {
+                    HStack(spacing: 8) {
+                        Button(action: onArchive) {
+                            Image(systemName: row.tree.isArchived ? "archivebox.fill" : "archivebox")
+                                .font(.system(size: 12))
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundColor(row.tree.isArchived ? .accentColor : .secondary)
+                        .help(row.tree.isArchived ? "取消归档（快捷键 X）" : "归档（快捷键 X）")
 
-                    Button(action: onDeleteTree) {
-                        Image(systemName: "trash")
-                            .font(.system(size: 11))
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundColor(.secondary)
-                    .help("删除该记录及其下全部 chunk")
+                        Button(action: onDeleteTree) {
+                            Image(systemName: "trash")
+                                .font(.system(size: 11))
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundColor(.secondary)
+                        .help("删除该记录及其下全部分段（快捷键 ⌫）")
 
-                    Button(action: onArchive) {
-                        Image(systemName: row.tree.isArchived ? "archivebox.fill" : "archivebox")
-                            .font(.system(size: 12))
+                        Button(action: onStartAddChunk) {
+                            Image(systemName: "plus")
+                                .font(.system(size: 12, weight: .bold))
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundColor(.secondary)
+                        .help("在该记录末尾追加分段")
                     }
-                    .buttonStyle(.plain)
-                    .foregroundColor(row.tree.isArchived ? .accentColor : .secondary)
-                    .help(row.tree.isArchived ? "取消归档" : "归档")
-
-                    Button(action: onStartAddChunk) {
-                        Image(systemName: "plus")
-                            .font(.system(size: 12, weight: .bold))
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundColor(.secondary)
-                    .help("在该记录末尾追加 chunk")
+                    .padding(.top, 2)
+                    .transition(.opacity)
                 }
-                .padding(.top, 2)
             }
             .padding(8)
             .background(
                 RoundedRectangle(cornerRadius: 6)
-                    .fill(isHovered ? Color.accentColor.opacity(0.10) : Color.clear)
+                    .fill(rowBackgroundColor)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 6)
+                    .stroke(
+                        isKeyboardSelected ? Color.accentColor.opacity(0.6) : Color.clear,
+                        lineWidth: 1
+                    )
             )
             .background(treeHoverGeometry)
             .opacity(row.tree.isArchived ? 0.55 : 1.0)
             .onHover { hov in onHoverChanged(hov) }
+            .contextMenu {
+                rowContextMenu
+            }
+            .animation(.easeInOut(duration: 0.12), value: isHovered)
+            .animation(.easeInOut(duration: 0.12), value: isKeyboardSelected)
 
             if isExpanded {
                 VStack(alignment: .leading, spacing: 2) {
@@ -1219,6 +1558,26 @@ private struct TreeRowView: View {
                 .transition(.opacity)
             }
         }
+    }
+
+    /// 行底色：键盘选中 > 鼠标悬停 > 无状态
+    private var rowBackgroundColor: Color {
+        if isKeyboardSelected { return Color.accentColor.opacity(0.16) }
+        if isHovered { return Color.accentColor.opacity(0.10) }
+        return Color.clear
+    }
+
+    @ViewBuilder
+    private var rowContextMenu: some View {
+        Button(isExpanded ? "折叠" : "展开", action: onToggle)
+        Button("复制整棵记录", action: onCopyTree)
+        Button("复制最新分段内容", action: onCopyRecord)
+            .disabled(row.tree.latest == nil)
+        Divider()
+        Button("追加分段…", action: onStartAddChunk)
+        Button(row.tree.isArchived ? "取消归档" : "归档", action: onArchive)
+        Divider()
+        Button("删除记录…", role: .destructive, action: onDeleteTree)
     }
 
     private var treeHoverGeometry: some View {
@@ -1298,6 +1657,11 @@ private struct TreeRowView: View {
         )
         .background(chunkHoverGeometry(for: c, hovered: hov))
         .onHover { hov in onChunkHover(c.id, hov) }
+        .contextMenu {
+            Button("复制该分段", action: { onCopyChunk(c.id) })
+            Button("删除该分段", role: .destructive, action: { onDeleteChunk(c.id) })
+                .disabled(row.chunks.count <= 1)
+        }
     }
 
     private func chunkHoverGeometry(for c: ChunkRowVM, hovered: Bool) -> some View {

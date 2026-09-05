@@ -89,6 +89,15 @@ struct DayBucket {
     var count: Int
 }
 
+/// 日期跳转用的目录项（每个有记录的日子一项，含跨屏信息）
+struct DayJumpItem: Identifiable {
+    var id: String { dayKey }
+    let dayKey: String
+    let label: String
+    let count: Int
+    let pageCount: Int
+}
+
 // MARK: - 视图模式
 
 enum AppViewMode: Equatable {
@@ -112,6 +121,8 @@ final class AppModel: ObservableObject {
     @Published var rows: [TreeRowVM] = []
     @Published var dayTitle = "暂无记录"
     @Published var dayMetaText = ""
+    /// 当前屏所在日期（yyyy-MM-dd），供日期跳转目录标记当前位置
+    @Published var currentDayKey = ""
     @Published var hasNewer = false
     @Published var hasOlder = false
     @Published var expandedTreeID: String?
@@ -125,6 +136,9 @@ final class AppModel: ObservableObject {
     @Published var viewMode: AppViewMode = .list
     @Published var previousViewMode: AppViewMode? = nil
     @Published var searchResults: [SearchResultVM] = []
+
+    /// 底部日期跳转目录（最新在上，每项一个“有记录的日子”）
+    @Published var dayJumpItems: [DayJumpItem] = []
 
     /// 列表内单个记录的删除是否需要二次确认（默认开启：删除不可恢复，先确认再执行）
     @Published var requireDeleteConfirm = true
@@ -532,7 +546,7 @@ final class AppModel: ObservableObject {
         if c.isImage {
             writeImageAndFlag(c)
         } else {
-            writeAndFlag(content: c.content, chunkID: c.id)
+            writeAndFlag(content: c.content, chunkID: c.id, feedback: "已复制最新内容")
         }
     }
 
@@ -544,7 +558,7 @@ final class AppModel: ObservableObject {
         if vm.chunk.isImage {
             writeImageAndFlag(vm.chunk)
         } else {
-            writeAndFlag(content: vm.chunk.content, chunkID: chunkID)
+            writeAndFlag(content: vm.chunk.content, chunkID: chunkID, feedback: "已复制该分段")
         }
     }
 
@@ -559,7 +573,8 @@ final class AppModel: ObservableObject {
             return
         }
         ClipboardSession.shared.beginTreeCopy(content: text)
-        showToast("已复制整棵记录")
+        let n = row.tree.chunks.count
+        showToast(n > 1 ? "已复制整棵记录（\(n) 段）" : "已复制整棵记录")
     }
 
     static func treeExportText(_ t: TreeRec) -> String {
@@ -622,7 +637,7 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func writeAndFlag(content: String, chunkID: String) {
+    private func writeAndFlag(content: String, chunkID: String, feedback: String = "已复制") {
         let pb = NSPasteboard.general
         pb.clearContents()
         guard pb.setString(content, forType: .string) else {
@@ -630,7 +645,7 @@ final class AppModel: ObservableObject {
             return
         }
         ClipboardSession.shared.beginCopy(content: content, chunkID: chunkID)
-        showToast("已复制")
+        showToast(feedback)
     }
 
     /// 图片 chunk 回写：把原图（PNG+TIFF）放回剪贴板，并附带自我复制标记，不清空时文本保持空
@@ -661,29 +676,46 @@ final class AppModel: ObservableObject {
 
     // MARK: - 分页导航
 
-    func goNewer() {
+    /// scroll：是否同时滚动到新屏顶部（键盘翻页时由键盘焦点接管定位，传 false）
+    func goNewer(scroll: Bool = true) {
         guard cursor > 0 else { return }
         cursor -= 1
         expandedTreeID = nil
         highlightedChunkID = nil
         loadPage()
-        // 翻页后固定回到该屏顶部，避免停留在上一屏的滚动深度造成“原地跳变”
-        scrollTargetTreeID = rows.first?.id
+        if scroll {
+            // 翻页后固定回到该屏顶部，避免停留在上一屏的滚动深度造成“原地跳变”
+            scrollTargetTreeID = rows.first?.id
+        }
     }
 
-    func goOlder() {
+    func goOlder(scroll: Bool = true) {
         guard cursor < units.count - 1 else { return }
         cursor += 1
         expandedTreeID = nil
         highlightedChunkID = nil
         loadPage()
-        scrollTargetTreeID = rows.first?.id
+        if scroll {
+            scrollTargetTreeID = rows.first?.id
+        }
     }
 
     /// 直接回到最新记录所在的那一屏
     func goToNewestPage() {
         guard cursor > 0 else { return }
         cursor = 0
+        expandedTreeID = nil
+        highlightedChunkID = nil
+        loadPage()
+        scrollTargetTreeID = rows.first?.id
+    }
+
+    /// 跳到指定日期的第一屏（日期目录项来自 dayJumpItems）
+    func jumpToDay(_ dayKey: String) {
+        guard let idx = units.firstIndex(where: { $0.dayKey == dayKey && $0.pageNo == 0 }) else {
+            return
+        }
+        cursor = idx
         expandedTreeID = nil
         highlightedChunkID = nil
         loadPage()
@@ -752,6 +784,16 @@ final class AppModel: ObservableObject {
                     )
                 }
             }
+            dayJumpItems = buckets.map { b in
+                let pages = max(1, (b.count + Config.pageSize - 1) / Config.pageSize)
+                return DayJumpItem(
+                    dayKey: b.key,
+                    label: TimeUtil.dayLabel(ms: b.startMs),
+                    count: b.count,
+                    pageCount: pages
+                )
+            }
+
             var newUnits: [PageUnit] = []
             for b in buckets {
                 let pages = max(1, (b.count + Config.pageSize - 1) / Config.pageSize)
@@ -787,8 +829,10 @@ final class AppModel: ObservableObject {
         rows = []
         dayTitle = "暂无记录"
         dayMetaText = ""
+        currentDayKey = ""
         hasNewer = false
         hasOlder = false
+        dayJumpItems = []
     }
 
     private func loadPage() {
@@ -813,6 +857,7 @@ final class AppModel: ObservableObject {
             return
         }
         rows = trees.map { TreeRowVM(tree: $0) }
+        currentDayKey = u.dayKey
         dayTitle = TimeUtil.dayLabel(ms: u.dayStartMs)
         dayMetaText = u.pagesInDay > 1
             ? "共 \(u.dayCount) 条 · 第 \(u.pageNo + 1)/\(u.pagesInDay) 屏"
