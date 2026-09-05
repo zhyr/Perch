@@ -429,6 +429,53 @@ final class DataStore {
         )
     }
 
+    /// 批量删除多条整树记录（含其下全部 chunk 与图片附件）。
+    /// 一次性聚合受影响的天，供上层统一重写 Markdown 归档。
+    struct TreeDeleteSummary {
+        /// 实际删除成功的记录 id
+        var treeIDs: [String] = []
+        var chunkCount: Int = 0
+        var dayKeys: Set<String> = []
+    }
+
+    func deleteTrees(_ treeIDs: [String]) throws -> TreeDeleteSummary {
+        var summary = TreeDeleteSummary()
+        guard !treeIDs.isEmpty else { return summary }
+        let placeholders = Array(repeating: "?", count: treeIDs.count).joined(separator: ",")
+        let params: [Any?] = treeIDs
+
+        // 受影响天（记录原归属天），只统计确实存在的树
+        let treeRows = try query(
+            "SELECT id, updated_at AS ua FROM maintree WHERE id IN (\(placeholders))",
+            params
+        )
+        for r in treeRows {
+            summary.treeIDs.append(str(r, "id"))
+            summary.dayKeys.insert(TimeUtil.dayKey(int(r, "ua")))
+        }
+        guard !summary.treeIDs.isEmpty else { return summary }
+        let existParams: [Any?] = summary.treeIDs
+        let existPH = Array(repeating: "?", count: summary.treeIDs.count).joined(separator: ",")
+
+        let cntRows = try query(
+            "SELECT COUNT(*) AS c FROM chunk WHERE maintree_id IN (\(existPH))",
+            existParams
+        )
+        summary.chunkCount = Int(cntRows.first.map { int($0, "c") } ?? 0)
+
+        // 清理图片附件，再级联删除 chunk 与 maintree
+        let attRows = try query(
+            "SELECT attachment AS at FROM chunk WHERE maintree_id IN (\(existPH)) AND attachment != ''",
+            existParams
+        )
+        for a in attRows {
+            Self.removeAttachmentIfExists(str(a, "at"))
+        }
+        try run("DELETE FROM chunk WHERE maintree_id IN (\(existPH))", existParams)
+        try run("DELETE FROM maintree WHERE id IN (\(existPH))", existParams)
+        return summary
+    }
+
     /// 尽力清理附件文件（仅允许删除 images/ 目录内的文件，防止误删其它内容）
     private static func removeAttachmentIfExists(_ relativePath: String) {
         guard !relativePath.isEmpty,

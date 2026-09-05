@@ -5,6 +5,8 @@ import Foundation
 enum Config {
     /// 60 秒合并窗口：与最后一次更新的 chunk 间隔在此范围内，复制会并入同一 maintree
     static let mergeWindowMs: Int64 = 60_000
+    /// 外部复制可入库的最小长度（不计空白）：少于该长度视为无意义复制，先入库再按规则清理
+    static let minCaptureTextLen = 5
     /// 每屏最大条数
     static let pageSize = 10
     /// 窗口可调最小尺寸
@@ -189,11 +191,15 @@ enum TimeUtil {
     private static let hourKeyFmt = makeFmt("HH")
     private static let clockFmt = makeFmt("HH:mm:ss")
     private static let monthDayFmt = makeFmt("M月d日 EEEE")
+    private static let titleDateFmt = makeFmt("MM/dd EEE")
 
     static func dayKey(_ ms: Int64) -> String { dayKeyFmt.string(from: date(fromMs: ms)) }
     static func hourKey(_ ms: Int64) -> String { hourKeyFmt.string(from: date(fromMs: ms)) }
     static func clock(_ ms: Int64) -> String { clockFmt.string(from: date(fromMs: ms)) }
     static func monthDay(_ ms: Int64) -> String { monthDayFmt.string(from: date(fromMs: ms)) }
+
+    /// 底部日期标题：09/05 周六 这种 mm/dd + 短星期格式
+    static func titleDate(ms: Int64) -> String { titleDateFmt.string(from: date(fromMs: ms)) }
 
     /// 同一天内只显示时分秒，否则补上日期
     static func displayTime(_ ms: Int64) -> String {
@@ -250,5 +256,19 @@ enum PreviewUtil {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard flat.count > maxLen else { return flat }
         return String(flat.prefix(maxLen)) + "…"
+    }
+}
+
+// MARK: - 复制内容规则（用于剪贴板监听入库后的清理判定）
+
+enum CaptureFilter {
+    /// 文字的有效字数：忽略全部空白后统计字符数（中文“字”与英文“字符”等价计数）。
+    static func visibleTextLength(_ s: String) -> Int {
+        s.filter { !$0.isWhitespace }.count
+    }
+
+    /// 是否属于“过短复制”（不计空白少于 Config.minCaptureTextLen），应被清理而不保留入库。
+    static func isTooShort(_ s: String) -> Bool {
+        visibleTextLength(s) < Config.minCaptureTextLen
     }
 }

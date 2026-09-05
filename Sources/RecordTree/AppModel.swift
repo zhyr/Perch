@@ -321,10 +321,36 @@ final class AppModel: ObservableObject {
         do {
             let at = TimeUtil.msNow()
             let info = try store.performExternalCopy(content: content, source: source, atMs: at)
+            // 处理规则：先按正常流程保存入库，随后对“过短复制”做清理（撤掉刚入库的分段）。
+            // 不直接改写用户剪贴板，避免干扰自我复制判定与第三方粘贴体验。
+            if CaptureFilter.isTooShort(content) {
+                cleanUpTooShort(info, content: content, source: source, atMs: at)
+                return
+            }
             archive(info: info, kind: "复制自外部", content: content, source: source, atMs: at)
             reload()
         } catch {
             NSLog("handleExternalCopy error: \(error)")
+        }
+    }
+
+    /// 撤销一次“过短复制”的入库：删除对应分段；若该分段是树上唯一分段则整树一并删除。
+    /// 事件日志不写入“复制”记录（本就不该成为历史），只重写受影响天归档并刷新列表。
+    private func cleanUpTooShort(_ info: MutationInfo, content: String, source: String, atMs: Int64) {
+        guard let store else { return }
+        do {
+            guard let deletion = try store.deleteChunk(info.chunkID ?? "") else {
+                reload()
+                return
+            }
+            for day in deletion.affectedDays {
+                try? store.rewriteDailyMarkdown(dayKey: day)
+            }
+            if expandedTreeID == deletion.treeID { expandedTreeID = nil }
+            reload()
+            NSLog("已按规则清理过短复制（<\(Config.minCaptureTextLen) 字）：from \(source), content=\(content)")
+        } catch {
+            NSLog("cleanUpTooShort error: \(error)")
         }
     }
 
@@ -609,6 +635,35 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// 批量删除多条整树记录（主列表多选删除）。
+    /// 一次删除 + 一次事件日志 + 一次归档重写，避免多次 reload 造成界面跳动。
+    func deleteTrees(_ treeIDs: [String]) {
+        guard let store, !treeIDs.isEmpty else { return }
+        do {
+            let at = TimeUtil.msNow()
+            let summary = try store.deleteTrees(treeIDs)
+            guard !summary.treeIDs.isEmpty else { return }
+            let block = DataStore.eventBlock(
+                kind: "批量删除记录（\(summary.treeIDs.count) 条，含 \(summary.chunkCount) 个分段）",
+                content: "删除记录：\n" + summary.treeIDs.joined(separator: "\n"),
+                source: AppInfo.zhName,
+                treeID: summary.treeIDs.first ?? "",
+                chunkID: nil,
+                atMs: at
+            )
+            try? store.writeEventLog(atMs: at, block: block)
+            for day in summary.dayKeys {
+                try? store.rewriteDailyMarkdown(dayKey: day)
+            }
+            expandedTreeID = nil
+            highlightedChunkID = nil
+            reload()
+            showToast("已删除 \(summary.treeIDs.count) 条记录")
+        } catch {
+            NSLog("deleteTrees error: \(error)")
+        }
+    }
+
     func deleteChunk(_ chunkID: String) {
         guard let store else { return }
         guard
@@ -858,7 +913,7 @@ final class AppModel: ObservableObject {
         }
         rows = trees.map { TreeRowVM(tree: $0) }
         currentDayKey = u.dayKey
-        dayTitle = TimeUtil.dayLabel(ms: u.dayStartMs)
+        dayTitle = TimeUtil.titleDate(ms: u.dayStartMs)
         dayMetaText = u.pagesInDay > 1
             ? "共 \(u.dayCount) 条 · 第 \(u.pageNo + 1)/\(u.pagesInDay) 屏"
             : "共 \(u.dayCount) 条 · 全部"

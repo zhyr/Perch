@@ -19,26 +19,48 @@ private struct ChunkHoverFrameKey: PreferenceKey {
 
 private struct DeleteRequest: Identifiable {
     enum Kind {
-        case tree
+        /// 一条或多条整树记录（多选删除时 treeIDs 可能不止一个）
+        case trees
         case chunk
         case all
     }
     let kind: Kind
-    let treeID: String
+    let treeIDs: [String]
     let chunkID: String?
     let treeChunkCount: Int
+
+    // 兼容既有单条删除调用点
+    init(kind: Kind, treeID: String, chunkID: String?, treeChunkCount: Int) {
+        self.kind = kind
+        self.treeIDs = [treeID]
+        self.chunkID = chunkID
+        self.treeChunkCount = treeChunkCount
+    }
+
+    // 多选删除专用
+    init(trees ids: [String], totalChunks: Int) {
+        self.kind = .trees
+        self.treeIDs = ids
+        self.chunkID = nil
+        self.treeChunkCount = totalChunks
+    }
 
     var id: String {
         switch kind {
         case .all: return "all"
-        case .tree: return treeID
+        case .trees: return treeIDs.sorted().joined(separator: ",")
         case .chunk: return chunkID ?? ""
         }
     }
 
+    var isMultiple: Bool { kind == .trees && treeIDs.count > 1 }
+
     var message: String {
         switch kind {
-        case .tree:
+        case .trees:
+            if treeIDs.count > 1 {
+                return "将删除所选 \(treeIDs.count) 条记录及其下 \(treeChunkCount) 个分段，此操作不可恢复。"
+            }
             return "将删除该记录及其下 \(treeChunkCount) 个分段，此操作不可恢复。"
         case .chunk:
             return "将删除该分段，此操作不可恢复。"
@@ -78,6 +100,10 @@ struct ContentView: View {
     @State private var discardNewDraft = false
     /// 底部日期跳转目录
     @State private var showDayJump = false
+
+    // 多选删除：进入多选模式后可勾选多条记录批量删除
+    @State private var multiSelectActive = false
+    @State private var selectedTreeIDs: Set<String> = []
 
     // 悬停浮层（全局坐标）
     @State private var hoverTreeFrame: CGRect?
@@ -134,7 +160,11 @@ struct ContentView: View {
             // 非列表页各自拥有完整的内容与操作区，不再显示列表翻页条
             if model.viewMode == .list {
                 Divider()
-                bottomBar
+                if multiSelectActive {
+                    multiSelectBar
+                } else {
+                    bottomBar
+                }
             }
         }
         .frame(
@@ -179,6 +209,10 @@ struct ContentView: View {
         .onChange(of: model.viewMode) { _ in
             keyboardFocusedTreeID = nil
             showDayJump = false
+            // 离开主列表时退出多选，避免残留勾选状态
+            if model.viewMode != .list {
+                resetMultiSelect()
+            }
         }
         .animation(.easeOut(duration: 0.15), value: confirmDelete != nil)
         .animation(.easeInOut(duration: 0.18), value: model.lastToast)
@@ -336,8 +370,9 @@ struct ContentView: View {
 
     private func performDelete(_ req: DeleteRequest) {
         switch req.kind {
-        case .tree:
-            model.deleteTree(req.treeID)
+        case .trees:
+            model.deleteTrees(req.treeIDs)
+            resetMultiSelect()
         case .chunk:
             if let cid = req.chunkID {
                 model.deleteChunk(cid)
@@ -357,6 +392,63 @@ struct ContentView: View {
         }
     }
 
+    // MARK: - 多选删除
+
+    private func enterMultiSelect() {
+        multiSelectActive = true
+        selectedTreeIDs.removeAll()
+        keyboardFocusedTreeID = nil
+        cancelHoverPreview()
+    }
+
+    private func exitMultiSelect() {
+        resetMultiSelect()
+    }
+
+    private func resetMultiSelect() {
+        multiSelectActive = false
+        selectedTreeIDs.removeAll()
+    }
+
+    /// 勾选 / 取消勾选某条记录（多选模式下点行主体也触发）
+    private func toggleRowSelection(_ treeID: String) {
+        if selectedTreeIDs.contains(treeID) {
+            selectedTreeIDs.remove(treeID)
+        } else {
+            selectedTreeIDs.insert(treeID)
+        }
+        keyboardFocusedTreeID = treeID
+    }
+
+    /// 当前整页是否已全部选中
+    private var currentPageAllSelected: Bool {
+        !model.rows.isEmpty && model.rows.allSatisfy { selectedTreeIDs.contains($0.id) }
+    }
+
+    /// 全选本页 / 取消全选本页
+    private func toggleSelectCurrentPage() {
+        if currentPageAllSelected {
+            model.rows.forEach { selectedTreeIDs.remove($0.id) }
+        } else {
+            model.rows.forEach { selectedTreeIDs.insert($0.id) }
+        }
+    }
+
+    /// 所选记录的分段总数（用于确认文案）
+    private func selectedChunkCount(_ ids: [String]) -> Int {
+        model.rows
+            .filter { ids.contains($0.id) }
+            .reduce(0) { $0 + $1.tree.chunks.count }
+    }
+
+    private func confirmDeleteSelection() {
+        let ids = Array(selectedTreeIDs)
+        guard !ids.isEmpty else { return }
+        requestDelete(
+            DeleteRequest(trees: ids, totalChunks: selectedChunkCount(ids))
+        )
+    }
+
     // MARK: - 列表几何（用于浮层定位）
 
     private var listGeometry: some View {
@@ -372,8 +464,10 @@ struct ContentView: View {
     private var hoverCard: some View {
         let text = hoverText
         return Group {
-            // 滚动期间或鼠标刚扫过（未稳定停留）时不显示预览卡，避免视觉抖动
+            // 滚动期间或鼠标刚扫过（未稳定停留）时不显示预览卡，避免视觉抖动；
+            // 多选模式下悬停含义变为“待勾选”，同样不弹出预览，避免误读
             if !model.scrollInProgress,
+               !multiSelectActive,
                hoverPreviewReady,
                let hf = hoverFrame,
                !listFrame.isEmpty,
@@ -529,6 +623,11 @@ struct ContentView: View {
               !model.rows.isEmpty
         else { return false }
 
+        // 多选模式有独立的键位语义：先交由其处理
+        if multiSelectActive {
+            return handleMultiSelectKeyEvent(event)
+        }
+
         // 排除带 Command / Control / Option 的组合键，不劫持系统与全局快捷键
         guard event.modifierFlags.intersection([.command, .control, .option]).isEmpty else {
             return false
@@ -577,6 +676,62 @@ struct ContentView: View {
                     return true
                 }
                 return false
+            default:
+                break
+            }
+        }
+        return false
+    }
+
+    /// 多选模式的键盘操作：↑/↓ 移动焦点，空格勾选当前行，⌫ 删除所选，
+    /// ⌘A / A 全选本页，ESC 退出。返回 true 表示已消费该按键。
+    private func handleMultiSelectKeyEvent(_ event: NSEvent) -> Bool {
+        // ⌘A 全选 / 取消全选本页（优先于下方组合键拦截）
+        if event.modifierFlags.contains(.command),
+           event.charactersIgnoringModifiers?.lowercased() == "a" {
+            toggleSelectCurrentPage()
+            return true
+        }
+        // 其余带 Command / Control / Option 的组合键放行给系统或全局快捷键
+        guard event.modifierFlags.intersection([.command, .control, .option]).isEmpty else {
+            return false
+        }
+        switch event.keyCode {
+        case 53: // ESC：退出多选
+            exitMultiSelect()
+            return true
+        case 125: // ↓
+            moveKeyboardSelection(+1)
+            return true
+        case 126: // ↑
+            moveKeyboardSelection(-1)
+            return true
+        case 49: // 空格：勾选 / 取消勾选当前焦点行
+            if let id = keyboardFocusedTreeID {
+                toggleRowSelection(id)
+            }
+            return true
+        case 51, 117: // ⌫ / 向前删除：删除所选（未选任何记录时退化为删除焦点行）
+            if !selectedTreeIDs.isEmpty {
+                confirmDeleteSelection()
+            } else {
+                deleteFocusedTree()
+            }
+            return true
+        default:
+            break
+        }
+        if let ch = event.charactersIgnoringModifiers?.lowercased() {
+            switch ch {
+            case "j":
+                moveKeyboardSelection(+1)
+                return true
+            case "k":
+                moveKeyboardSelection(-1)
+                return true
+            case "a":
+                toggleSelectCurrentPage()
+                return true
             default:
                 break
             }
@@ -637,7 +792,7 @@ struct ContentView: View {
               let row = model.rows.first(where: { $0.id == id }) else { return }
         requestDelete(
             DeleteRequest(
-                kind: .tree,
+                kind: .trees,
                 treeID: id,
                 chunkID: nil,
                 treeChunkCount: row.tree.chunks.count
@@ -652,7 +807,11 @@ struct ContentView: View {
             titleBar
             // 快捷动作行只在主列表展示，避免在编辑器/设置等场景下出现无关全局操作
             if model.viewMode == .list {
-                inputRow
+                if multiSelectActive {
+                    multiSelectHintRow
+                } else {
+                    inputRow
+                }
             }
         }
     }
@@ -763,6 +922,35 @@ struct ContentView: View {
             }
             .keyboardShortcut("n", modifiers: .command)
             .help("新建一条记录（⌘N）")
+
+            Button(action: enterMultiSelect) {
+                Label("多选", systemImage: "checkmark.circle")
+            }
+            .controlSize(.small)
+            .help("进入多选：批量勾选记录后一并删除")
+        }
+        .padding(.horizontal, 12)
+        .padding(.top, 6)
+        .padding(.bottom, 6)
+    }
+
+    /// 多选模式下的顶部提示行（替代搜索/新建行，避免误触发页面切换）
+    private var multiSelectHintRow: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "checkmark.circle")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(.accentColor)
+            Text("多选模式：点行首圆圈勾选记录")
+                .font(.system(size: 12))
+                .foregroundColor(.secondary)
+                .lineLimit(1)
+            Spacer(minLength: 8)
+            Text("已选 \(selectedTreeIDs.count) 条")
+                .font(.caption2)
+                .foregroundColor(.secondary)
+            Button("完成", action: exitMultiSelect)
+                .controlSize(.small)
+                .help("退出多选模式（ESC）")
         }
         .padding(.horizontal, 12)
         .padding(.top, 6)
@@ -832,6 +1020,8 @@ struct ContentView: View {
                                 isExpanded: model.expandedTreeID == row.id,
                                 isHovered: hoveredTreeID == row.id,
                                 isKeyboardSelected: keyboardFocusedTreeID == row.id,
+                                isMultiSelecting: multiSelectActive,
+                                isSelected: selectedTreeIDs.contains(row.id),
                                 hoveredChunkID: hoveredChunkID,
                                 highlightedChunkID: model.highlightedChunkID,
                                 isAddingChunk: chunkDraftTreeID == row.id,
@@ -841,6 +1031,12 @@ struct ContentView: View {
                                     withAnimation(.easeInOut(duration: 0.16)) {
                                         model.toggleExpanded(row.id)
                                     }
+                                },
+                                onToggleSelect: {
+                                    toggleRowSelection(row.id)
+                                },
+                                onToggleSelectAllInPage: {
+                                    toggleSelectCurrentPage()
                                 },
                                 onCopyTree: {
                                     markKeyboardFocus(row.id)
@@ -862,7 +1058,7 @@ struct ContentView: View {
                                     markKeyboardFocus(row.id)
                                     requestDelete(
                                         DeleteRequest(
-                                            kind: .tree,
+                                            kind: .trees,
                                             treeID: row.id,
                                             chunkID: nil,
                                             treeChunkCount: row.tree.chunks.count
@@ -930,6 +1126,37 @@ struct ContentView: View {
 
     // MARK: - 底部导航条（仅主列表展示）
 
+    /// 多选模式下的批量操作条：全选本页 / 已选计数 / 批量删除 / 完成
+    private var multiSelectBar: some View {
+        HStack(spacing: 10) {
+            Button(action: toggleSelectCurrentPage) {
+                Text(currentPageAllSelected ? "取消全选本页" : "全选本页")
+            }
+            .disabled(model.rows.isEmpty)
+            .help(currentPageAllSelected
+                  ? "清空当前页的勾选"
+                  : "勾选本页全部记录（⌘A）")
+
+            Spacer(minLength: 4)
+
+            Text("已选 \(selectedTreeIDs.count) 条")
+                .font(.caption)
+                .foregroundColor(.secondary)
+
+            Button("删除所选", role: .destructive, action: confirmDeleteSelection)
+                .disabled(selectedTreeIDs.isEmpty)
+                .help("删除所有已勾选的记录（需确认）")
+
+            Button("完成", action: exitMultiSelect)
+                .keyboardShortcut(.cancelAction)
+                .help("退出多选模式（ESC）")
+        }
+        .controlSize(.small)
+        .padding(.leading, 12)
+        .padding(.trailing, 26) // 右侧预留右下角缩放手柄
+        .padding(.vertical, 6)
+    }
+
     private var bottomBar: some View {
         HStack(spacing: 10) {
             Button {
@@ -942,13 +1169,13 @@ struct ContentView: View {
 
             Spacer(minLength: 4)
 
-            // 日期中心按钮：展开“日期跳转目录”，在深翻页后也可一键回最新
+            // 日期中心按钮：点击 mm/dd 周几 文本弹出“日期跳转目录”，在深翻页后也可一键回最新
             let jumpable = model.dayJumpItems.count > 1
             VStack(spacing: 2) {
                 Text(model.dayTitle).font(.headline)
-                Text(jumpable ? "点按跳转日期" : model.dayMetaText)
+                Text(model.dayMetaText)
                     .font(.caption)
-                    .foregroundColor(jumpable ? Color.accentColor : Color.secondary)
+                    .foregroundColor(.secondary)
             }
             .contentShape(Rectangle())
             .onTapGesture {
@@ -959,7 +1186,7 @@ struct ContentView: View {
                 }
             }
             .help(jumpable
-                  ? "打开日期跳转目录（可直达任意日期或回到最新）"
+                  ? "点按跳转日期"
                   : "回到最新记录所在的一屏")
             .opacity(jumpable || model.hasNewer ? 1 : 0.55)
 
@@ -1313,7 +1540,8 @@ private struct DeleteConfirmDialog: View {
 
     private var titleText: String {
         switch request.kind {
-        case .tree: return "删除该记录？"
+        case .trees:
+            return request.treeIDs.count > 1 ? "删除所选 \(request.treeIDs.count) 条记录？" : "删除该记录？"
         case .chunk: return "删除该分段？"
         case .all: return "清空全部数据？"
         }
@@ -1445,12 +1673,18 @@ private struct TreeRowView: View {
     let isExpanded: Bool
     let isHovered: Bool
     let isKeyboardSelected: Bool
+    /// 是否处于列表多选模式（此时行主体点击 = 勾选，而非复制）
+    let isMultiSelecting: Bool
+    /// 多选模式下该行是否已被勾选
+    let isSelected: Bool
     let hoveredChunkID: String?
     let highlightedChunkID: String?
     let isAddingChunk: Bool
     @Binding var chunkDraft: String
     @FocusState private var addChunkFocused: Bool
     let onToggle: () -> Void
+    let onToggleSelect: () -> Void
+    let onToggleSelectAllInPage: () -> Void
     let onCopyTree: () -> Void
     let onCopyRecord: () -> Void
     let onCopyChunk: (String) -> Void
@@ -1469,6 +1703,20 @@ private struct TreeRowView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(alignment: .top, spacing: 6) {
+                // 多选模式：最左侧显示勾选框；focusable(false) 防止刚进入多选时首行圆圈因焦点环误显示为蓝色
+                if isMultiSelecting {
+                    Button(action: onToggleSelect) {
+                        Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundColor(isSelected ? Color.accentColor : Color.secondary)
+                            .frame(width: 15)
+                    }
+                    .buttonStyle(.plain)
+                    .focusable(false)
+                    .padding(.top, 3)
+                    .help(isSelected ? "取消选中该记录" : "选中该记录")
+                }
+
                 Button(action: onToggle) {
                     Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
                         .font(.system(size: 10, weight: .bold))
@@ -1476,9 +1724,10 @@ private struct TreeRowView: View {
                         .frame(width: 14)
                 }
                 .buttonStyle(.plain)
+                .focusable(false)
                 .padding(.top, 4)
 
-                // 左侧主内容：单击复制整棵记录（标题 + 全部分段，按时序）
+                // 左侧主内容：多选模式下点击切换勾选；平时单击复制整棵记录
                 VStack(alignment: .leading, spacing: 3) {
                     primaryText
                     Text(row.caption)
@@ -1488,17 +1737,21 @@ private struct TreeRowView: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .contentShape(Rectangle())
-                .onTapGesture(perform: onCopyTree)
-                .help("单击复制整棵记录（标题 + 全部分段）；右键可展开 / 归档 / 删除等")
+                .onTapGesture(perform: isMultiSelecting ? onToggleSelect : onCopyTree)
+                .help(isMultiSelecting
+                      ? (isSelected ? "已选中：点击可取消勾选（空格）" : "点击勾选该记录（空格）")
+                      : "单击复制整棵记录（标题 + 全部分段）；右键可展开 / 归档 / 删除等")
 
                 // 行内操作仅在悬停 / 展开 / 键盘选中时展示，避免日常浏览被按钮占满
-                if showActions {
+                // 多选模式下隐藏单行操作，避免与批量勾选语义冲突（右键菜单仍可用）
+                if showActions && !isMultiSelecting {
                     HStack(spacing: 8) {
                         Button(action: onArchive) {
                             Image(systemName: row.tree.isArchived ? "archivebox.fill" : "archivebox")
                                 .font(.system(size: 12))
                         }
                         .buttonStyle(.plain)
+                        .focusable(false)
                         .foregroundColor(row.tree.isArchived ? .accentColor : .secondary)
                         .help(row.tree.isArchived ? "取消归档（快捷键 X）" : "归档（快捷键 X）")
 
@@ -1507,6 +1760,7 @@ private struct TreeRowView: View {
                                 .font(.system(size: 11))
                         }
                         .buttonStyle(.plain)
+                        .focusable(false)
                         .foregroundColor(.secondary)
                         .help("删除该记录及其下全部分段（快捷键 ⌫）")
 
@@ -1515,6 +1769,7 @@ private struct TreeRowView: View {
                                 .font(.system(size: 12, weight: .bold))
                         }
                         .buttonStyle(.plain)
+                        .focusable(false)
                         .foregroundColor(.secondary)
                         .help("在该记录末尾追加分段")
                     }
@@ -1560,8 +1815,9 @@ private struct TreeRowView: View {
         }
     }
 
-    /// 行底色：键盘选中 > 鼠标悬停 > 无状态
+    /// 行底色：多选已勾选 > 键盘选中 > 鼠标悬停 > 无状态
     private var rowBackgroundColor: Color {
+        if isMultiSelecting, isSelected { return Color.accentColor.opacity(0.16) }
         if isKeyboardSelected { return Color.accentColor.opacity(0.16) }
         if isHovered { return Color.accentColor.opacity(0.10) }
         return Color.clear
@@ -1569,6 +1825,11 @@ private struct TreeRowView: View {
 
     @ViewBuilder
     private var rowContextMenu: some View {
+        if isMultiSelecting {
+            Button(isSelected ? "取消选中" : "选中该记录", action: onToggleSelect)
+            Button("全选本页", action: onToggleSelectAllInPage)
+            Divider()
+        }
         Button(isExpanded ? "折叠" : "展开", action: onToggle)
         Button("复制整棵记录", action: onCopyTree)
         Button("复制最新分段内容", action: onCopyRecord)
@@ -1631,6 +1892,7 @@ private struct TreeRowView: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .focusable(false)
             .help("复制该分段内容")
 
             Spacer(minLength: 0)
@@ -1643,6 +1905,7 @@ private struct TreeRowView: View {
                         .font(.system(size: 10))
                 }
                 .buttonStyle(.plain)
+                .focusable(false)
                 .foregroundColor(.secondary)
                 .help("删除该分段")
                 .padding(.trailing, 2)
