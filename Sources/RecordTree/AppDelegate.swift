@@ -74,9 +74,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         escMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard event.keyCode == UInt16(kVK_Escape) else { return event }
             guard let self, self.panel.isVisible, self.panel.isKeyWindow else { return event }
+            // 正在编辑文本（TextField / TextEditor 的第一响应者是 NSTextView）时，
+            // 把 Esc 交还给编辑器与“取消”按钮，避免一按 Esc 就误隐藏整个面板。
+            if self.isEditingText() { return event }
             self.hidePanel()
             return nil
         }
+    }
+
+    /// 当前第一响应者是否为文本编辑控件（SwiftUI TextField/TextEditor 编辑态均为 NSTextView 字段编辑器）
+    private func isEditingText() -> Bool {
+        guard let fr = panel?.firstResponder else { return false }
+        if fr is NSTextView { return true }
+        if let tf = fr as? NSTextField, tf.currentEditor() != nil { return true }
+        return false
+    }
+
+    /// 面板当前是否处于 key 状态（用于剪贴板监听区分“应用内操作”与“外部复制”）
+    func isPanelKeyWindow() -> Bool {
+        panel?.isKeyWindow ?? false
     }
 
     /// 列表滚动时临时抑制悬停高亮/预览：

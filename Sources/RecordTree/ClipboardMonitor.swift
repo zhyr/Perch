@@ -59,9 +59,20 @@ final class ClipboardMonitor {
     private var timer: Timer?
     private var lastChangeCount = -1
     private var initialized = false
+    private var editObservers: [NSObjectProtocol] = []
+    /// 面板内是否正有文本处于编辑状态（TextField / TextEditor）
+    private var textEditingActive = false
 
     func start() {
         guard timer == nil else { return }
+        let nc = NotificationCenter.default
+        // SwiftUI TextField 的字段编辑器与 TextEditor 在编辑中都会发出 NSText 编辑通知
+        editObservers.append(nc.addObserver(forName: NSText.didBeginEditingNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.textEditingActive = true
+        })
+        editObservers.append(nc.addObserver(forName: NSText.didEndEditingNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.textEditingActive = false
+        })
         timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             self?.tick()
         }
@@ -70,6 +81,11 @@ final class ClipboardMonitor {
     func stop() {
         timer?.invalidate()
         timer = nil
+        for token in editObservers {
+            NotificationCenter.default.removeObserver(token)
+        }
+        editObservers.removeAll()
+        textEditingActive = false
     }
 
     private func tick() {
@@ -99,6 +115,13 @@ final class ClipboardMonitor {
         }
         if let chunkID = pb.string(forType: ClipboardImage.selfCopyMarkerType) {
             AppModel.shared.handleSelfCopy(chunkID: chunkID)
+            return
+        }
+
+        // 用户正在面板内编辑文本时，⌘C/⌘X 产生的剪贴板变化属于应用内部操作，
+        // 不应当作“外部复制”重新入库，否则输入过程中会在背后新增记录并整页重排，
+        // 造成输入中断、列表抖动。仅在“编辑中”才拦截，避免误吞打开面板前的正常外部复制。
+        if textEditingActive, (NSApp.delegate as? AppDelegate)?.isPanelKeyWindow() == true {
             return
         }
 

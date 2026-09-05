@@ -64,6 +64,9 @@ struct ContentView: View {
     @State private var searchWork: DispatchWorkItem?
     /// 进入搜索界面后自动聚焦输入框，方便直接输入
     @FocusState private var searchFieldFocused: Bool
+    /// 新建 maintree 编辑区的焦点（自动聚焦标题，回车跳到正文）
+    @FocusState private var newTitleFocused: Bool
+    @FocusState private var newContentFocused: Bool
 
     // 在当前 maintree 后追加 chunk 的草稿
     @State private var chunkDraftTreeID: String?
@@ -460,8 +463,9 @@ struct ContentView: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
+                ScrollViewReader { proxy in
                 ScrollView {
-                    LazyVStack(spacing: 2) {
+                    VStack(spacing: 2) {
                         ForEach(model.rows) { row in
                             TreeRowView(
                                 row: row,
@@ -471,7 +475,11 @@ struct ContentView: View {
                                 highlightedChunkID: model.highlightedChunkID,
                                 isAddingChunk: chunkDraftTreeID == row.id,
                                 chunkDraft: $chunkDraftText,
-                                onToggle: { model.toggleExpanded(row.id) },
+                                onToggle: {
+                                    withAnimation(.easeInOut(duration: 0.16)) {
+                                        model.toggleExpanded(row.id)
+                                    }
+                                },
                                 onCopyTree: { model.copyTree(row.id) },
                                 onCopyChunk: { model.copyChunk($0) },
                                 onArchive: { model.toggleArchiveTree(row.id) },
@@ -496,7 +504,9 @@ struct ContentView: View {
                                     )
                                 },
                                 onStartAddChunk: {
-                                    model.toggleExpanded(row.id)
+                                    withAnimation(.easeInOut(duration: 0.16)) {
+                                        model.toggleExpanded(row.id)
+                                    }
                                     chunkDraftTreeID = row.id
                                     chunkDraftText = ""
                                 },
@@ -519,9 +529,19 @@ struct ContentView: View {
                                     hoveredChunkID = hov ? cid : nil
                                 }
                             )
+                            .id(row.id)
                         }
                     }
                     .padding(8)
+                }
+                .onChange(of: model.scrollTargetTreeID) { treeID in
+                    guard let treeID else { return }
+                    let p = proxy
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+                        p.scrollTo(treeID, anchor: .top)
+                        model.consumeScrollTarget()
+                    }
+                }
                 }
             }
         }
@@ -580,6 +600,13 @@ struct ContentView: View {
 
     // MARK: - 新建 maintree 编辑区
 
+    private func clearNewRecordDraft() {
+        newTitle = ""
+        newContent = ""
+        newTitleFocused = false
+        newContentFocused = false
+    }
+
     private var newRecordEditor: some View {
         VStack(spacing: 0) {
             HStack {
@@ -587,10 +614,10 @@ struct ContentView: View {
                     .font(.headline)
                 Spacer()
                 Button("取消") {
+                    clearNewRecordDraft()
                     model.cancelNewRecord()
-                    newTitle = ""
-                    newContent = ""
                 }
+                .keyboardShortcut(.cancelAction)
             }
             .padding(.horizontal, 12)
             .padding(.top, 12)
@@ -599,17 +626,21 @@ struct ContentView: View {
             VStack(spacing: 10) {
                 TextField("标题（可选）", text: $newTitle)
                     .textFieldStyle(.roundedBorder)
+                    .focused($newTitleFocused)
+                    .onSubmit { newContentFocused = true }
 
                 ZStack(alignment: .topLeading) {
                     TextEditor(text: $newContent)
                         .font(.system(size: 13))
                         .frame(minHeight: 180)
+                        .focused($newContentFocused)
                     if newContent.isEmpty {
                         Text("在此输入 maintree record 的内容…")
                             .font(.system(size: 13))
                             .foregroundColor(.secondary)
                             .padding(.top, 6)
                             .padding(.leading, 4)
+                            .allowsHitTesting(false)
                     }
                 }
             }
@@ -621,8 +652,11 @@ struct ContentView: View {
                     if model.createNewRecord(title: newTitle, content: newContent) {
                         newTitle = ""
                         newContent = ""
+                        newTitleFocused = false
+                        newContentFocused = false
                     }
                 }
+                .keyboardShortcut(.defaultAction)
                 .disabled(newContent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
             .padding(.horizontal, 12)
@@ -632,6 +666,12 @@ struct ContentView: View {
             Spacer()
         }
         .background(Color(nsColor: .windowBackgroundColor))
+        .onAppear {
+            // 面板为非激活型，延迟一拍让 window/keyWindow 就绪后再聚焦
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+                newTitleFocused = true
+            }
+        }
     }
 
     // MARK: - 搜索区
@@ -949,6 +989,7 @@ private struct TreeRowView: View {
     let highlightedChunkID: String?
     let isAddingChunk: Bool
     @Binding var chunkDraft: String
+    @FocusState private var addChunkFocused: Bool
     let onToggle: () -> Void
     let onCopyTree: () -> Void
     let onCopyChunk: (String) -> Void
@@ -1042,6 +1083,7 @@ private struct TreeRowView: View {
                 .padding(.leading, 24)
                 .padding(.bottom, 6)
                 .padding(.trailing, 8)
+                .transition(.opacity)
             }
         }
     }
@@ -1138,9 +1180,18 @@ private struct TreeRowView: View {
         HStack(spacing: 8) {
             TextField("新分段内容…", text: $chunkDraft)
                 .textFieldStyle(.roundedBorder)
+                .focused($addChunkFocused)
+                .onSubmit { onSaveChunk() }
+                .onAppear {
+                    DispatchQueue.main.async {
+                        addChunkFocused = true
+                    }
+                }
             Button("保存") { onSaveChunk() }
+                .keyboardShortcut(.defaultAction)
                 .disabled(chunkDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             Button("取消") { onCancelChunk() }
+                .keyboardShortcut(.cancelAction)
         }
         .padding(.vertical, 4)
         .padding(.leading, 8)

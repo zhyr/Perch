@@ -117,6 +117,8 @@ final class AppModel: ObservableObject {
     @Published var expandedTreeID: String?
     @Published var highlightedChunkID: String?
     @Published var lastToast: String?
+    /// 数据变更导致列表重排后，需要把某条记录滚动到可视区域（视图消费后应调用 consumeScrollTarget 置空）
+    @Published var scrollTargetTreeID: String?
     /// 列表滚动进行中：UI 据此临时抑制悬停高亮/预览，避免滚动时内容抖动
     @Published var scrollInProgress = false
 
@@ -447,7 +449,7 @@ final class AppModel: ObservableObject {
             let info = try store.performManualNewRecord(title: title, content: content, atMs: at)
             archive(info: info, kind: "手工新建记录", content: content, source: "手动输入", atMs: at)
             reload()
-            relocateIfNeeded(info)
+            revealTree(info.treeID, expand: false)
             viewMode = .list
             showToast("已新建 maintree record")
             return true
@@ -484,8 +486,7 @@ final class AppModel: ObservableObject {
             }
             archive(info: info, kind: "手工追加分段", content: content, source: "手动输入", atMs: at)
             reload()
-            relocateIfNeeded(info)
-            expandedTreeID = treeID
+            revealTree(treeID, expand: true)
             showToast("已追加分段")
             return true
         } catch {
@@ -514,22 +515,12 @@ final class AppModel: ObservableObject {
 
     func openSearchResult(treeID: String, chunkID: String) {
         reload() // 确保分页单位最新
-        guard let idx = latestMetas.firstIndex(where: { $0.id == treeID }) else { return }
-        let meta = latestMetas[idx]
-        let range = TimeUtil.dayRangeMs(meta.updatedAtMs)
-        let dayKey = TimeUtil.dayKey(meta.updatedAtMs)
-        let rank = latestMetas[0..<idx].filter { $0.updatedAtMs >= range.start && $0.updatedAtMs < range.end }.count
-        let pageNo = rank / Config.pageSize
-
-        if let unitIdx = units.firstIndex(where: { $0.dayKey == dayKey && $0.pageNo == pageNo }) {
-            cursor = unitIdx
-            loadPage()
-            expandedTreeID = treeID
-            highlightedChunkID = chunkID
-            viewMode = .list
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { [weak self] in
-                self?.highlightedChunkID = nil
-            }
+        guard latestMetas.contains(where: { $0.id == treeID }) else { return }
+        highlightedChunkID = chunkID
+        revealTree(treeID, expand: true)
+        viewMode = .list
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { [weak self] in
+            self?.highlightedChunkID = nil
         }
     }
 
@@ -623,8 +614,8 @@ final class AppModel: ObservableObject {
                 atMs: TimeUtil.msNow()
             )
             if highlightedChunkID == chunkID { highlightedChunkID = nil }
-            expandedTreeID = row.id
             reload()
+            revealTree(row.id, expand: true)
             showToast("已删除分段")
         } catch {
             NSLog("deleteChunk error: \(error)")
@@ -676,6 +667,8 @@ final class AppModel: ObservableObject {
         expandedTreeID = nil
         highlightedChunkID = nil
         loadPage()
+        // 翻页后固定回到该屏顶部，避免停留在上一屏的滚动深度造成“原地跳变”
+        scrollTargetTreeID = rows.first?.id
     }
 
     func goOlder() {
@@ -684,10 +677,42 @@ final class AppModel: ObservableObject {
         expandedTreeID = nil
         highlightedChunkID = nil
         loadPage()
+        scrollTargetTreeID = rows.first?.id
     }
 
     func toggleExpanded(_ treeID: String) {
         expandedTreeID = (expandedTreeID == treeID) ? nil : treeID
+    }
+
+    /// 视图已消费滚动定位请求后调用
+    func consumeScrollTarget() {
+        scrollTargetTreeID = nil
+    }
+
+    /// 数据变更引发列表重排后，把当前页切换到包含 treeID 的那一屏，并请求滚动到该记录。
+    /// 必须在 reload()（latestMetas / units / rows 已更新）之后调用。
+    func revealTree(_ treeID: String, expand: Bool) {
+        guard store != nil,
+              let idx = latestMetas.firstIndex(where: { $0.id == treeID })
+        else {
+            if expand { expandedTreeID = nil }
+            return
+        }
+        let meta = latestMetas[idx]
+        let range = TimeUtil.dayRangeMs(meta.updatedAtMs)
+        let dayKey = TimeUtil.dayKey(meta.updatedAtMs)
+        let rank = latestMetas[0..<idx].filter { $0.updatedAtMs >= range.start && $0.updatedAtMs < range.end }.count
+        let pageNo = rank / Config.pageSize
+        guard let unitIdx = units.firstIndex(where: { $0.dayKey == dayKey && $0.pageNo == pageNo }) else {
+            if expand { expandedTreeID = nil }
+            return
+        }
+        if cursor != unitIdx {
+            cursor = unitIdx
+            loadPage()
+        }
+        if expand { expandedTreeID = treeID }
+        scrollTargetTreeID = treeID
     }
 
     // MARK: - 重载与页面加载
