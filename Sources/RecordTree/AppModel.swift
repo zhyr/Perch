@@ -126,8 +126,8 @@ final class AppModel: ObservableObject {
     @Published var previousViewMode: AppViewMode? = nil
     @Published var searchResults: [SearchResultVM] = []
 
-    /// 列表内单个记录的删除是否需要二次确认（默认否，即点击即删）
-    @Published var requireDeleteConfirm = false
+    /// 列表内单个记录的删除是否需要二次确认（默认开启：删除不可恢复，先确认再执行）
+    @Published var requireDeleteConfirm = true
 
     /// 全局快捷键：keyCode 与 Carbon 修饰符
     @Published var shortcutKeyCode: UInt32 = UInt32(kVK_ANSI_P)
@@ -451,7 +451,7 @@ final class AppModel: ObservableObject {
             reload()
             revealTree(info.treeID, expand: false)
             viewMode = .list
-            showToast("已新建 maintree record")
+            showToast("已新建记录")
             return true
         } catch {
             NSLog("createNewRecord error: \(error)")
@@ -674,6 +674,16 @@ final class AppModel: ObservableObject {
     func goOlder() {
         guard cursor < units.count - 1 else { return }
         cursor += 1
+        expandedTreeID = nil
+        highlightedChunkID = nil
+        loadPage()
+        scrollTargetTreeID = rows.first?.id
+    }
+
+    /// 直接回到最新记录所在的那一屏
+    func goToNewestPage() {
+        guard cursor > 0 else { return }
+        cursor = 0
         expandedTreeID = nil
         highlightedChunkID = nil
         loadPage()

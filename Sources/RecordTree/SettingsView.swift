@@ -6,6 +6,8 @@ import Carbon
 /// 行内辅助控件统一放在右侧，保持与主界面一致的视觉节奏。
 struct SettingsView: View {
     @ObservedObject var model: AppModel
+    /// 由外层 ContentView 传入：打开“清空全部”的二次确认弹层（与删除确认同一套 UI）
+    let onRequestClearAll: () -> Void
     @State private var isRecording = false
     @State private var eventMonitor: Any?
 
@@ -157,6 +159,33 @@ struct SettingsView: View {
             .background(
                 RoundedRectangle(cornerRadius: 7, style: .continuous)
                     .fill(Color.secondary.opacity(0.08))
+            )
+
+            HStack(spacing: 10) {
+                Image(systemName: "trash.slash")
+                    .font(.system(size: 12))
+                    .foregroundColor(.red)
+                    .frame(width: 16)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("清空全部记录")
+                        .font(.system(size: 13))
+                        .foregroundColor(.red)
+                    Text("删除所有记录与分段，此操作不可恢复")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+
+                Spacer(minLength: 8)
+
+                Button("清空", role: .destructive, action: onRequestClearAll)
+                    .controlSize(.small)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .background(
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .fill(Color.red.opacity(0.07))
             )
         }
     }

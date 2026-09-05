@@ -39,9 +39,9 @@ private struct DeleteRequest: Identifiable {
     var message: String {
         switch kind {
         case .tree:
-            return "将删除该 maintree record 及其下 \(treeChunkCount) 个 chunk，此操作不可恢复。"
+            return "将删除该记录及其下 \(treeChunkCount) 个分段，此操作不可恢复。"
         case .chunk:
-            return "将删除该 chunk 分段，此操作不可恢复。"
+            return "将删除该分段，此操作不可恢复。"
         case .all:
             return "将清空全部记录及全部分段，所有数据不可恢复。"
         }
@@ -74,11 +74,16 @@ struct ContentView: View {
 
     // 删除确认
     @State private var confirmDelete: DeleteRequest?
+    /// 新建记录编辑器：存在未保存内容时离开需确认丢弃
+    @State private var discardNewDraft = false
 
     // 悬停浮层（全局坐标）
     @State private var hoverTreeFrame: CGRect?
     @State private var hoverChunkFrame: CGRect?
     @State private var listFrame: CGRect = .zero
+    /// 悬停预览延迟就绪：鼠标快速扫过各行时不逐行弹卡，停顿片刻才展示
+    @State private var hoverPreviewReady = false
+    @State private var hoverPreviewWork: DispatchWorkItem?
 
     // 右下角拖拽缩放
     @State private var resizeStartFrame: NSRect?
@@ -102,14 +107,28 @@ struct ContentView: View {
             }
             .background(listGeometry)
             .overlay(alignment: .topLeading) { hoverCard }
+            .overlay(alignment: .bottom) { toastView }
             .onChange(of: hoveredTreeID) { _ in
-                if hoveredTreeID == nil { hoverTreeFrame = nil }
+                if hoveredTreeID == nil {
+                    hoverTreeFrame = nil
+                    cancelHoverPreview()
+                } else {
+                    scheduleHoverPreview()
+                }
             }
             .onChange(of: hoveredChunkID) { _ in
-                if hoveredChunkID == nil { hoverChunkFrame = nil }
+                if hoveredChunkID == nil {
+                    hoverChunkFrame = nil
+                    cancelHoverPreview()
+                } else {
+                    scheduleHoverPreview()
+                }
             }
-            Divider()
-            bottomBar
+            // 非列表页各自拥有完整的内容与操作区，不再显示列表翻页条
+            if model.viewMode == .list {
+                Divider()
+                bottomBar
+            }
         }
         .frame(
             minWidth: Config.panelMinWidth,
@@ -127,6 +146,12 @@ struct ContentView: View {
                     .transition(.opacity)
             }
         }
+        .overlay {
+            if discardNewDraft {
+                discardDraftLayer
+                    .transition(.opacity)
+            }
+        }
         .onChange(of: model.scrollInProgress) { scrolling in
             // 开始滚动即清除旧悬停位，避免滚动结束后残留高亮/预览导致视觉跳变
             guard scrolling else { return }
@@ -134,8 +159,11 @@ struct ContentView: View {
             hoveredChunkID = nil
             hoverTreeFrame = nil
             hoverChunkFrame = nil
+            cancelHoverPreview()
         }
         .animation(.easeOut(duration: 0.15), value: confirmDelete != nil)
+        .animation(.easeInOut(duration: 0.18), value: model.lastToast)
+        .animation(.easeOut(duration: 0.1), value: hoverPreviewReady)
     }
 
     // MARK: - 删除确认（自定义左对齐弹层，替代系统 alert，保证与整体布局一致）
@@ -151,6 +179,39 @@ struct ContentView: View {
                     onConfirm: { performDelete(req) }
                 )
             }
+        }
+    }
+
+    // MARK: - 新建记录：丢弃草稿确认
+
+    /// 是否有未保存的草稿（标题或正文任一非空）
+    private var hasNewDraft: Bool {
+        !newTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || !newContent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// 取消/ESC 离开编辑器：有草稿先确认，避免静默丢失输入
+    private func cancelNewRecordEditing() {
+        if hasNewDraft {
+            discardNewDraft = true
+        } else {
+            clearNewRecordDraft()
+            model.cancelNewRecord()
+        }
+    }
+
+    private var discardDraftLayer: some View {
+        ZStack {
+            Color.black.opacity(0.12)
+                .onTapGesture { discardNewDraft = false }
+            DiscardDraftDialog(
+                onContinue: { discardNewDraft = false },
+                onDiscard: {
+                    discardNewDraft = false
+                    clearNewRecordDraft()
+                    model.cancelNewRecord()
+                }
+            )
         }
     }
 
@@ -192,8 +253,12 @@ struct ContentView: View {
     private var hoverCard: some View {
         let text = hoverText
         return Group {
-            // 滚动期间不显示悬停预览，避免卡片随滚动跳变造成视觉抖动
-            if !model.scrollInProgress, let hf = hoverFrame, !listFrame.isEmpty, !text.isEmpty {
+            // 滚动期间或鼠标刚扫过（未稳定停留）时不显示预览卡，避免视觉抖动
+            if !model.scrollInProgress,
+               hoverPreviewReady,
+               let hf = hoverFrame,
+               !listFrame.isEmpty,
+               !text.isEmpty {
                 HoverCard(
                     title: hoverTitle,
                     text: text,
@@ -202,6 +267,26 @@ struct ContentView: View {
                 )
             }
         }
+    }
+
+    /// 悬停稳定一小段时间后再展示预览卡（跟随目标行，不额外锁定鼠标）
+    private func scheduleHoverPreview() {
+        hoverPreviewWork?.cancel()
+        hoverPreviewReady = false
+        let w = DispatchWorkItem { [self] in
+            if !self.model.scrollInProgress,
+               self.hoveredTreeID != nil || self.hoveredChunkID != nil {
+                self.hoverPreviewReady = true
+            }
+        }
+        hoverPreviewWork = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18, execute: w)
+    }
+
+    private func cancelHoverPreview() {
+        hoverPreviewWork?.cancel()
+        hoverPreviewWork = nil
+        hoverPreviewReady = false
     }
 
     private var hoverFrame: CGRect? { hoverChunkFrame ?? hoverTreeFrame }
@@ -279,7 +364,8 @@ struct ContentView: View {
     private var topToolbar: some View {
         VStack(spacing: 0) {
             titleBar
-            if model.viewMode != .searchResults {
+            // 快捷动作行只在主列表展示，避免在编辑器/设置等场景下出现无关全局操作
+            if model.viewMode == .list {
                 inputRow
             }
         }
@@ -341,7 +427,7 @@ struct ContentView: View {
             .buttonStyle(.plain)
             .foregroundColor(.secondary)
             .focusable(false)
-            .help("快捷键设置")
+            .help("设置（快捷键 / 数据 / 同步）")
 
             Button(action: openGitHub) {
                 Label("开源仓库", systemImage: "globe")
@@ -357,22 +443,10 @@ struct ContentView: View {
         .padding(.bottom, 4)
     }
 
-    /// 顶部快捷行：搜索入口 + 新建 + 全部清空。
-    /// 搜索入口呈现为“搜索框”样式，点击与底部“搜索”按钮行为一致：跳转到搜索界面并聚焦输入框。
+    /// 顶部快捷行：搜索入口 + 新建。主列表页唯二的全局动作，避免重复/拥挤。
+    /// 搜索入口呈现为“搜索框”样式，点击跳转到搜索界面并聚焦输入框。
     private var inputRow: some View {
         HStack(spacing: 8) {
-            if model.viewMode != .list {
-                Button {
-                    model.returnToList()
-                } label: {
-                    Image(systemName: "list.bullet")
-                        .font(.system(size: 12))
-                }
-                .buttonStyle(.plain)
-                .foregroundColor(.secondary)
-                .help("返回主列表")
-            }
-
             Button(action: openSearchPage) {
                 HStack(spacing: 6) {
                     Image(systemName: "magnifyingglass")
@@ -395,27 +469,14 @@ struct ContentView: View {
                 )
             }
             .buttonStyle(.plain)
-            .help("打开搜索界面")
+            .keyboardShortcut("f", modifiers: .command)
+            .help("打开搜索界面（⌘F）")
 
-            Button {
-                model.showNewRecord()
-            } label: {
-                Label("新建 maintree", systemImage: "doc.badge.plus")
+            Button(action: { model.showNewRecord() }) {
+                Label("新建记录", systemImage: "doc.badge.plus")
             }
-            .help("新建一条 maintree record")
-
-            Button {
-                confirmDelete = DeleteRequest(
-                    kind: .all,
-                    treeID: "",
-                    chunkID: nil,
-                    treeChunkCount: 0
-                )
-            } label: {
-                Label("全部清空", systemImage: "trash.slash")
-            }
-            .disabled(model.rows.isEmpty)
-            .help("一键清空全部记录与分段（需二次确认）")
+            .keyboardShortcut("n", modifiers: .command)
+            .help("新建一条记录（⌘N）")
         }
         .padding(.horizontal, 12)
         .padding(.top, 6)
@@ -550,7 +611,7 @@ struct ContentView: View {
         .onPreferenceChange(ChunkHoverFrameKey.self) { hoverChunkFrame = $0 }
     }
 
-    // MARK: - 底部导航与操作条
+    // MARK: - 底部导航条（仅主列表展示）
 
     private var bottomBar: some View {
         HStack(spacing: 10) {
@@ -560,11 +621,23 @@ struct ContentView: View {
                 Label("较新", systemImage: "chevron.left")
             }
             .disabled(!model.hasNewer)
+            .help("切到更新的记录")
 
+            Spacer(minLength: 4)
+
+            // 点击日期回到最新一屏，避免在深翻页后只能一屏屏点“较新”
             VStack(spacing: 2) {
                 Text(model.dayTitle).font(.headline)
-                Text(model.dayMetaText).font(.caption).foregroundColor(.secondary)
+                Text(model.hasNewer ? "点击回到最新记录" : model.dayMetaText)
+                    .font(.caption)
+                    .foregroundColor(model.hasNewer ? Color.accentColor : Color.secondary)
             }
+            .contentShape(Rectangle())
+            .onTapGesture { model.goToNewestPage() }
+            .help("回到最新记录所在的一屏")
+            .opacity(model.hasNewer ? 1 : 0.55)
+
+            Spacer(minLength: 4)
 
             Button {
                 model.goOlder()
@@ -572,30 +645,28 @@ struct ContentView: View {
                 Label("较旧", systemImage: "chevron.right")
             }
             .disabled(!model.hasOlder)
-
-            Spacer()
-
-            Button {
-                model.showNewRecord()
-            } label: {
-                Label("新建 maintree", systemImage: "doc.badge.plus")
-            }
-
-            Button(action: openSearchPage) {
-                Label("搜索", systemImage: "magnifyingglass")
-            }
-
-            if let t = model.lastToast {
-                Text(t)
-                    .font(.caption)
-                    .foregroundColor(.accentColor)
-                    .transition(.opacity)
-            }
+            .help("切到更旧的记录")
         }
         .controlSize(.small)
         .padding(.leading, 12)
         .padding(.trailing, 26) // 右侧预留右下角缩放手柄
         .padding(.vertical, 6)
+    }
+
+    // MARK: - 轻量浮层提示（不影响布局）
+
+    @ViewBuilder
+    private var toastView: some View {
+        if let t = model.lastToast {
+            Text(t)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundColor(.white)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 7)
+                .background(Capsule().fill(Color.black.opacity(0.72)))
+                .padding(.bottom, 10)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+        }
     }
 
     // MARK: - 新建 maintree 编辑区
@@ -610,14 +681,14 @@ struct ContentView: View {
     private var newRecordEditor: some View {
         VStack(spacing: 0) {
             HStack {
-                Text("新建 maintree record")
+                Text("新建记录")
                     .font(.headline)
                 Spacer()
                 Button("取消") {
-                    clearNewRecordDraft()
-                    model.cancelNewRecord()
+                    cancelNewRecordEditing()
                 }
                 .keyboardShortcut(.cancelAction)
+                .help("放弃草稿并返回（ESC）")
             }
             .padding(.horizontal, 12)
             .padding(.top, 12)
@@ -635,7 +706,7 @@ struct ContentView: View {
                         .frame(minHeight: 180)
                         .focused($newContentFocused)
                     if newContent.isEmpty {
-                        Text("在此输入 maintree record 的内容…")
+                        Text("在此输入记录内容…")
                             .font(.system(size: 13))
                             .foregroundColor(.secondary)
                             .padding(.top, 6)
@@ -767,6 +838,8 @@ struct ContentView: View {
             } label: {
                 Label("返回", systemImage: "chevron.left")
             }
+            .keyboardShortcut(.cancelAction)
+            .help("返回主列表（ESC）")
 
             TextField("搜索本地记录…", text: $searchText)
                 .textFieldStyle(.roundedBorder)
@@ -836,8 +909,68 @@ struct ContentView: View {
     // MARK: - 设置区
 
     private var settingsPanel: some View {
-        SettingsView(model: model)
-            .background(Color(nsColor: .windowBackgroundColor))
+        SettingsView(
+            model: model,
+            onRequestClearAll: {
+                confirmDelete = DeleteRequest(
+                    kind: .all,
+                    treeID: "",
+                    chunkID: nil,
+                    treeChunkCount: 0
+                )
+            }
+        )
+        .background(Color(nsColor: .windowBackgroundColor))
+    }
+}
+
+// MARK: - 丢弃草稿确认弹层
+
+/// 新建记录编辑器存在未保存内容时，取消/ESC 离开前给出确认，防止误触丢失输入。
+private struct DiscardDraftDialog: View {
+    let onContinue: () -> Void
+    let onDiscard: () -> Void
+
+    @State private var appeared = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 6) {
+                Image(systemName: "exclamationmark.triangle")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(.orange)
+                Text("放弃未保存的内容？")
+                    .font(.system(size: 14, weight: .semibold))
+            }
+
+            Text("离开后将丢弃尚未保存的标题与正文。若想保留，请选择“继续编辑”并点击保存。")
+                .font(.system(size: 12))
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            HStack(spacing: 8) {
+                Spacer(minLength: 0)
+                Button("继续编辑", action: onContinue)
+                    .keyboardShortcut(.cancelAction)
+                Button("放弃草稿", role: .destructive, action: onDiscard)
+                    .buttonStyle(.borderedProminent)
+                    .tint(.red)
+            }
+            .padding(.top, 6)
+        }
+        .padding(16)
+        .frame(width: 320, alignment: .leading)
+        .background(Color(nsColor: .controlBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(Color.secondary.opacity(0.2), lineWidth: 0.5)
+        )
+        .shadow(color: Color.black.opacity(0.2), radius: 18, x: 0, y: 8)
+        .scaleEffect(appeared ? 1 : 0.94)
+        .opacity(appeared ? 1 : 0)
+        .onAppear { appeared = true }
     }
 }
 
