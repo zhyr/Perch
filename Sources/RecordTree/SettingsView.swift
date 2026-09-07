@@ -19,6 +19,7 @@ struct SettingsView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 26) {
                     shortcutSection
+                    recordingSection
                     generalSection
                     syncSection
                 }
@@ -117,6 +118,94 @@ struct SettingsView: View {
                 .font(.caption)
                 .foregroundColor(.secondary)
         }
+    }
+
+    // MARK: - 启动与记录
+
+    private var recordingSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            sectionHeader("启动与记录")
+
+            HStack(spacing: 10) {
+                Image(systemName: "power")
+                    .font(.system(size: 12))
+                    .foregroundColor(.secondary)
+                    .frame(width: 16)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("开机自启动")
+                        .font(.system(size: 13))
+                    Text(model.launchAtLoginEnabled
+                         ? "已开启：登录后自动启动栖痕"
+                         : "已关闭：需手动启动栖痕")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+
+                Spacer(minLength: 8)
+
+                Toggle(
+                    "",
+                    isOn: Binding(
+                        get: { model.launchAtLoginEnabled },
+                        set: { model.setLaunchAtLogin($0) }
+                    )
+                )
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .disabled(!Self.canManageLoginItem)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .background(
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .fill(Color.secondary.opacity(0.08))
+            )
+
+            HStack(spacing: 10) {
+                Image(systemName: "doc.on.clipboard")
+                    .font(.system(size: 12))
+                    .foregroundColor(.secondary)
+                    .frame(width: 16)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("自动记录剪贴板")
+                        .font(.system(size: 13))
+                    Text(model.autoRecordClipboard
+                         ? "已开启：外部复制自动保存为记录"
+                         : "已关闭：不会自动保存，请使用 ⌘N 新建 / 追加分段手动保存")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+
+                Spacer(minLength: 8)
+
+                Toggle(
+                    "",
+                    isOn: Binding(
+                        get: { model.autoRecordClipboard },
+                        set: { model.setAutoRecordClipboard($0) }
+                    )
+                )
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .controlSize(.small)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .background(
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .fill(Color.secondary.opacity(0.08))
+            )
+        }
+    }
+
+    private static var canManageLoginItem: Bool {
+        if #available(macOS 13.0, *) {
+            return true
+        }
+        return false
     }
 
     // MARK: - 通用

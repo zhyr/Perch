@@ -865,6 +865,20 @@ struct ContentView: View {
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundColor(.primary)
             Spacer(minLength: 0)
+            Button(action: openBrewTaskNote) {
+                Capsule()
+                    .fill(Color.black)
+                    .frame(width: 26, height: 26)
+                    .overlay {
+                        Image(systemName: "checklist")
+                            .foregroundColor(.white)
+                            .font(.system(size: 11, weight: .medium))
+                    }
+            }
+            .buttonStyle(.plain)
+            .focusable(false)
+            .help("打开 brew 的 TaskNote 窗口")
+
             Button(action: { model.showSettings() }) {
                 Image(systemName: "gearshape")
                     .font(.system(size: 12))
@@ -976,6 +990,11 @@ struct ContentView: View {
     private func openGitHub() {
         guard let url = URL(string: "https://github.com/zhyr/Perch") else { return }
         NSWorkspace.shared.open(url)
+    }
+
+    /// 打开 brew.app 的 TaskNote 窗口
+    private func openBrewTaskNote() {
+        model.openBrewTaskNote()
     }
 
     // MARK: - 主内容区：列表 / 空状态

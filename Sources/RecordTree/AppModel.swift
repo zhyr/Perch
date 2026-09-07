@@ -2,6 +2,7 @@ import Foundation
 import Combine
 import AppKit
 import Carbon
+import ServiceManagement
 
 // MARK: - 列表 VM
 
@@ -143,6 +144,12 @@ final class AppModel: ObservableObject {
     /// 列表内单个记录的删除是否需要二次确认（默认开启：删除不可恢复，先确认再执行）
     @Published var requireDeleteConfirm = true
 
+    /// 开机自启动（macOS 13+ 使用 SMAppService.mainApp）
+    @Published var launchAtLoginEnabled = false
+
+    /// 是否自动记录外部剪贴板变化（关闭后只保留手动新建 / 追加分段）
+    @Published var autoRecordClipboard = true
+
     /// 全局快捷键：keyCode 与 Carbon 修饰符
     @Published var shortcutKeyCode: UInt32 = UInt32(kVK_ANSI_P)
     @Published var shortcutModifiers: UInt32 = UInt32(controlKey | shiftKey)
@@ -163,12 +170,97 @@ final class AppModel: ObservableObject {
         if defaults.object(forKey: "deleteRequiresConfirm") != nil {
             requireDeleteConfirm = defaults.bool(forKey: "deleteRequiresConfirm")
         }
+        if defaults.object(forKey: "autoRecordClipboard") != nil {
+            autoRecordClipboard = defaults.bool(forKey: "autoRecordClipboard")
+        }
+        launchAtLoginEnabled = Self.launchAtLoginStatus()
     }
 
     /// 更新“删除需二次确认”设置
     func setRequireDeleteConfirm(_ value: Bool) {
         requireDeleteConfirm = value
         UserDefaults.standard.set(value, forKey: "deleteRequiresConfirm")
+    }
+
+    // MARK: - 开机自启动
+
+    /// 查询 SMAppService 的注册状态
+    private static func launchAtLoginStatus() -> Bool {
+        guard #available(macOS 13.0, *) else { return false }
+        let status = SMAppService.mainApp.status
+        return status == .enabled
+    }
+
+    func setLaunchAtLogin(_ value: Bool) {
+        guard #available(macOS 13.0, *) else {
+            showToast("macOS 13 以下版本不支持该接口")
+            return
+        }
+        do {
+            if value {
+                try SMAppService.mainApp.register()
+            } else {
+                try SMAppService.mainApp.unregister()
+            }
+            launchAtLoginEnabled = Self.launchAtLoginStatus()
+            showToast(launchAtLoginEnabled ? "已设置开机自启动" : "已取消开机自启动")
+        } catch {
+            launchAtLoginEnabled = Self.launchAtLoginStatus()
+            showToast("自启动设置失败：\(error.localizedDescription)")
+            NSLog("setLaunchAtLogin error: \(error)")
+        }
+    }
+
+    // MARK: - 自动记录剪贴板
+
+    func setAutoRecordClipboard(_ value: Bool) {
+        autoRecordClipboard = value
+        UserDefaults.standard.set(value, forKey: "autoRecordClipboard")
+        showToast(value ? "已开启自动记录剪贴板" : "已关闭自动记录剪贴板，可手动新建/追加")
+    }
+
+    // MARK: - 打开 brew 的 TaskNote 窗口
+
+    /// brew 应用的 Bundle ID 与唤起用 URL scheme
+    private var brewBundleId: String { "com.Ebullioscopic.Atoll.dev" }
+    private var brewTaskNoteURL: URL? { URL(string: "atoll://tasknote?from=perch") }
+
+    /// brew.app 当前是否正在运行
+    private func brewIsRunning() -> Bool {
+        NSRunningApplication.runningApplications(withBundleIdentifier: brewBundleId).isEmpty == false
+    }
+
+    /// 在 Perch 顶部点击 TaskNote：打开 brew 的 TaskNote 窗口。
+    /// 优先通过 atoll://tasknote URL 唤起（支持冷启动与已运行两种情况）；
+    /// 若老版本 brew 未注册该 scheme，则退回“启动/激活 + 分布式通知”。
+    func openBrewTaskNote() {
+        guard NSWorkspace.shared.urlForApplication(withBundleIdentifier: brewBundleId) != nil else {
+            showToast("未找到 brew 应用")
+            return
+        }
+
+        // 方式一：URL scheme
+        if let url = brewTaskNoteURL, NSWorkspace.shared.open(url) {
+            return
+        }
+
+        // 方式二：启动 / 激活 brew，再通过分布式通知打开 TaskNote
+        let alreadyRunning = brewIsRunning()
+        if let brewURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: brewBundleId) {
+            NSWorkspace.shared.openApplication(
+                at: brewURL,
+                configuration: NSWorkspace.OpenConfiguration()
+            ) { _, _ in }
+        }
+        // 等待 brew 启动完成后发送，避免冷启动时漏收
+        DispatchQueue.main.asyncAfter(deadline: .now() + (alreadyRunning ? 0.3 : 1.0)) {
+            DistributedNotificationCenter.default().postNotificationName(
+                Notification.Name("com.zhyr.perch.openTaskNote"),
+                object: nil,
+                userInfo: nil,
+                deliverImmediately: true
+            )
+        }
     }
 
     func boot() throws {

@@ -125,6 +125,10 @@ final class ClipboardMonitor {
             return
         }
 
+        // 若用户关闭了“自动记录剪贴板”，不再将外部复制保存入库。
+        // 自我复制与手动新建 / 追加分段不受影响。
+        guard AppModel.shared.autoRecordClipboard else { return }
+
         // 2) 外部复制
         let source = ClipboardSession.shared.frontmostAppName()
         let text = pb.string(forType: .string)?
