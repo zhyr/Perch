@@ -999,20 +999,6 @@ struct ContentView: View {
             .focusable(false)
             .help("打开 Cella（层隅）")
 
-            Button(action: openBrewTaskNote) {
-                Capsule()
-                    .fill(Color.black)
-                    .frame(width: 26, height: 26)
-                    .overlay {
-                        Image(systemName: "checklist")
-                            .foregroundColor(.white)
-                            .font(.system(size: 11, weight: .medium))
-                    }
-            }
-            .buttonStyle(.plain)
-            .focusable(false)
-            .help("打开 brew 的 TaskNote 窗口")
-
             Button(action: { model.showSettings() }) {
                 Image(systemName: "gearshape")
                     .font(.system(size: 12))
@@ -1044,7 +1030,7 @@ struct ContentView: View {
                 HStack(spacing: 6) {
                     Image(systemName: "magnifyingglass")
                         .font(.system(size: 12))
-                    Text("搜索本地记录…")
+                    Text("关键词")
                         .font(.system(size: 13))
                     Spacer(minLength: 0)
                 }
@@ -1142,34 +1128,45 @@ struct ContentView: View {
         return NSImage(size: NSSize(width: 15, height: 15))
     }
 
+    /// 点击标题栏的 Cella 图标：在 Cella（层隅）里唤起它的任务面板。
+    ///
+    /// Cella 是 `LSUIElement` 应用，`activate` 不会让任何窗口出现，所以只能由 Cella
+    /// 自己把面板弹出来 —— 双方约定用分布式通知 `com.cella.app.showPanel` 触发
+    /// （Cella 侧在 `AppDelegate` 里监听同名通知）。
     private func openCellaApp() {
         let ws = NSWorkspace.shared
-        guard let appURL = ws.urlForApplication(withBundleIdentifier: "com.cella.app") else {
-            // 未安装：退化为在 Finder 中展示工程目录
-            ws.activateFileViewerSelecting([URL(fileURLWithPath: "/Users/yr.z/work/cella")])
+        let bundleId = "com.cella.app"
+
+        guard let appURL = ws.urlForApplication(withBundleIdentifier: bundleId) else {
+            model.showToast("未找到 Cella（层隅）应用，请先安装")
             return
         }
 
-        let showPanel = Notification.Name("com.cella.app.showPanel")
-        let running = ws.runningApplications.contains { $0.bundleIdentifier == "com.cella.app" }
-        if running {
-            // Cella 是 LSUIElement 应用，对已运行实例 activate 不会显示窗口；
-            // 通过分布式通知让它自己弹出面板
+        let requestPanel = {
             DistributedNotificationCenter.default().postNotificationName(
-                showPanel, object: nil, userInfo: nil, deliverImmediately: true
+                Notification.Name("com.cella.app.showPanel"),
+                object: nil,
+                userInfo: nil,
+                deliverImmediately: true
             )
-        } else {
-            let config = NSWorkspace.OpenConfiguration()
-            ws.openApplication(at: appURL, configuration: config) { _, error in
-                if error != nil {
-                    NSLog("打开 Cella 失败: \(error!.localizedDescription)")
+        }
+
+        if ws.runningApplications.contains(where: { $0.bundleIdentifier == bundleId }) {
+            requestPanel()
+            return
+        }
+
+        // 冷启动：必须等 Cella 启动完成（观察者已注册）后再发通知，
+        // 否则通知会石沉大海，表现为“点了图标没反应”。
+        let config = NSWorkspace.OpenConfiguration()
+        ws.openApplication(at: appURL, configuration: config) { _, error in
+            DispatchQueue.main.async {
+                if let error {
+                    NSLog("打开 Cella 失败: \(error.localizedDescription)")
+                    model.showToast("打开 Cella 失败：\(error.localizedDescription)")
+                    return
                 }
-            }
-            // 启动完成后补发一次，确保首次启动后面板可见
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
-                DistributedNotificationCenter.default().postNotificationName(
-                    showPanel, object: nil, userInfo: nil, deliverImmediately: true
-                )
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: requestPanel)
             }
         }
     }
@@ -1177,11 +1174,6 @@ struct ContentView: View {
     private func openGitHub() {
         guard let url = URL(string: "https://github.com/zhyr/Perch") else { return }
         NSWorkspace.shared.open(url)
-    }
-
-    /// 打开 brew.app 的 TaskNote 窗口
-    private func openBrewTaskNote() {
-        model.openBrewTaskNote()
     }
 
     // MARK: - 标签云 / 标签结果 / 标签编辑
@@ -1970,7 +1962,7 @@ struct ContentView: View {
             .keyboardShortcut(.cancelAction)
             .help("返回主列表（ESC）")
 
-            TextField("搜索本地记录…", text: $searchText)
+            TextField("关键词", text: $searchText)
                 .textFieldStyle(.roundedBorder)
                 .focused($searchFieldFocused)
                 .onSubmit {

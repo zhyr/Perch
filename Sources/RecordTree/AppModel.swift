@@ -236,50 +236,6 @@ final class AppModel: ObservableObject {
         showToast(value ? "已开启自动记录剪贴板" : "已关闭自动记录剪贴板，可手动新建/追加")
     }
 
-    // MARK: - 打开 brew 的 TaskNote 窗口
-
-    /// brew 应用的 Bundle ID 与唤起用 URL scheme
-    private var brewBundleId: String { "com.Ebullioscopic.Atoll.dev" }
-    private var brewTaskNoteURL: URL? { URL(string: "atoll://tasknote?from=perch") }
-
-    /// brew.app 当前是否正在运行
-    private func brewIsRunning() -> Bool {
-        NSRunningApplication.runningApplications(withBundleIdentifier: brewBundleId).isEmpty == false
-    }
-
-    /// 在 Perch 顶部点击 TaskNote：打开 brew 的 TaskNote 窗口。
-    /// 优先通过 atoll://tasknote URL 唤起（支持冷启动与已运行两种情况）；
-    /// 若老版本 brew 未注册该 scheme，则退回“启动/激活 + 分布式通知”。
-    func openBrewTaskNote() {
-        guard NSWorkspace.shared.urlForApplication(withBundleIdentifier: brewBundleId) != nil else {
-            showToast("未找到 brew 应用")
-            return
-        }
-
-        // 方式一：URL scheme
-        if let url = brewTaskNoteURL, NSWorkspace.shared.open(url) {
-            return
-        }
-
-        // 方式二：启动 / 激活 brew，再通过分布式通知打开 TaskNote
-        let alreadyRunning = brewIsRunning()
-        if let brewURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: brewBundleId) {
-            NSWorkspace.shared.openApplication(
-                at: brewURL,
-                configuration: NSWorkspace.OpenConfiguration()
-            ) { _, _ in }
-        }
-        // 等待 brew 启动完成后发送，避免冷启动时漏收
-        DispatchQueue.main.asyncAfter(deadline: .now() + (alreadyRunning ? 0.3 : 1.0)) {
-            DistributedNotificationCenter.default().postNotificationName(
-                Notification.Name("com.zhyr.perch.openTaskNote"),
-                object: nil,
-                userInfo: nil,
-                deliverImmediately: true
-            )
-        }
-    }
-
     func boot() throws {
         migrateAICloudDefaultsIfNeeded()
         // 若用户曾选择自定义数据目录（iCloud Drive / 同步盘），先恢复
@@ -696,14 +652,27 @@ final class AppModel: ObservableObject {
     }
 
     func updateShortcut(keyCode: UInt32, modifiers: UInt32) {
+        let oldKey = shortcutKeyCode
+        let oldMods = shortcutModifiers
         shortcutKeyCode = keyCode
         shortcutModifiers = modifiers
-        UserDefaults.standard.set(keyCode, forKey: "shortcutKeyCode")
-        UserDefaults.standard.set(modifiers, forKey: "shortcutModifiers")
-        applyShortcut()
+        let combo = shortcutDisplayString(keyCode: keyCode, modifiers: modifiers)
+        if applyShortcut() {
+            UserDefaults.standard.set(keyCode, forKey: "shortcutKeyCode")
+            UserDefaults.standard.set(modifiers, forKey: "shortcutModifiers")
+            showToast("快捷键已更新为 \(combo)")
+        } else {
+            // 注册失败（被系统/其它应用占用）时回滚，避免保存一个永远不生效的快捷键
+            shortcutKeyCode = oldKey
+            shortcutModifiers = oldMods
+            _ = applyShortcut()
+            showToast("\(combo) 注册失败：已被系统或其它应用占用")
+        }
     }
 
-    func applyShortcut() {
+    /// 应用当前快捷键设置。返回是否注册成功（失败说明组合被占用，见 HotkeyManager.register）
+    @discardableResult
+    func applyShortcut() -> Bool {
         HotkeyManager.shared.register(
             keyCode: shortcutKeyCode,
             modifiers: shortcutModifiers
@@ -767,11 +736,24 @@ final class AppModel: ObservableObject {
         guard let store else { return false }
         do {
             let at = TimeUtil.msNow()
+            // 图片必须复制为独立附件：若直接沿用剪切板条目的文件路径，
+            // 之后「删除该条目 / 清空剪切板历史」会把文件一并删除，导致笔记图片永久损坏。
+            var attachment = ""
+            if item.isImage {
+                guard let src = AppPaths.attachmentURL(relativePath: item.attachment),
+                      let data = try? Data(contentsOf: src),
+                      let copied = try? ClipboardImage.savePNG(data, dayKey: TimeUtil.dayKey(at), atMs: at)
+                else {
+                    showToast("归档失败：原图文件已丢失")
+                    return false
+                }
+                attachment = copied
+            }
             let info = try store.performManualNewRecord(
                 title: "",
                 content: item.content,
                 atMs: at,
-                attachment: item.isImage ? item.attachment : "",
+                attachment: attachment,
                 sourceApp: item.sourceApp
             )
             archive(
@@ -822,13 +804,31 @@ final class AppModel: ObservableObject {
         guard let content = cleaned(content), let store else { return false }
         do {
             let at = TimeUtil.msNow()
+            let oldUpd = try store.treeUpdatedMs(treeID)
             try store.updateTitle(treeID: treeID, title: title)
             // 找到首个分段（按创建时间正序的第一个）并更新内容
             let chunks = try store.chunks(ofTree: treeID).sorted { $0.createdAtMs < $1.createdAtMs }
+            var editedChunkID: String?
             if let first = chunks.first {
                 try store.updateChunkContent(chunkID: first.id, content: content, atMs: at)
                 try store.touchTree(treeID: treeID, atMs: at)
+                editedChunkID = first.id
             }
+            // 编辑会改变内容并把记录移动到「今天」，必须同步重写旧天与新天的 Markdown 归档，
+            // 否则 daily 归档会残留旧内容、且记录仍挂在旧日期下。
+            archive(
+                info: MutationInfo(
+                    treeID: treeID,
+                    chunkID: editedChunkID,
+                    newTree: false,
+                    oldDay: TimeUtil.dayKey(oldUpd == 0 ? at : oldUpd),
+                    newDay: TimeUtil.dayKey(at)
+                ),
+                kind: "编辑笔记",
+                content: content,
+                source: "手动编辑",
+                atMs: at
+            )
             reload()
             revealTree(treeID, expand: false)
             showToast("已更新笔记")
@@ -846,11 +846,19 @@ final class AppModel: ObservableObject {
         do {
             let wasArchived = rows.first(where: { $0.id == treeID })?.tree.isArchived ?? false
             try store.setArchived(treeID: treeID, archived: !wasArchived, atMs: TimeUtil.msNow())
+            // 归档状态会写入当天 Markdown（已归档标记），需重写该记录所属天的归档
+            rewriteArchiveDay(ofTree: treeID)
             reload()
             showToast(!wasArchived ? "已归档" : "已取消归档")
         } catch {
             NSLog("toggleArchiveTree error: \(error)")
         }
+    }
+
+    /// 仅重写某条记录所属天的 daily Markdown（用于不改动事件日志的元数据变更，如归档开关）
+    private func rewriteArchiveDay(ofTree treeID: String) {
+        guard let store, let updated = try? store.treeUpdatedMs(treeID) else { return }
+        try? store.rewriteDailyMarkdown(dayKey: TimeUtil.dayKey(updated))
     }
 
     // MARK: - 追加 chunk

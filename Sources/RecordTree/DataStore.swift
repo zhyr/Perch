@@ -410,10 +410,13 @@ final class DataStore {
 
     private func externalInsert(content: String, attachment: String, source: String, atMs: Int64) throws -> MutationInfo {
         let treeID: String
+        let isNewTree: Bool
         if let top = try latestUpdatedChunk(), atMs - top.updatedMs <= Config.mergeWindowMs {
             treeID = top.treeID
+            isNewTree = false
         } else {
             treeID = newID("tree")
+            isNewTree = true
             try run(
                 "INSERT INTO maintree (id, title, kind, created_at, updated_at, archived_at) VALUES (?, '', 'clipboard', ?, ?, 0)",
                 [treeID, atMs, atMs]
@@ -430,8 +433,8 @@ final class DataStore {
         return MutationInfo(
             treeID: treeID,
             chunkID: chunkID,
-            newTree: oldUpd == 0,
-            oldDay: TimeUtil.dayKey(oldUpd == 0 ? atMs : oldUpd),
+            newTree: isNewTree,
+            oldDay: TimeUtil.dayKey(isNewTree ? atMs : oldUpd),
             newDay: TimeUtil.dayKey(atMs)
         )
     }
@@ -508,15 +511,18 @@ final class DataStore {
 
     // MARK: - 删除
 
-    /// 删除整棵 maintree（连同其下全部 chunk 与图片附件）
+    /// 删除整棵 maintree（连同其下全部 chunk、图片附件与标签引用）
     func deleteTree(_ treeID: String) throws -> MutationInfo? {
         let rows = try query("SELECT updated_at AS ua FROM maintree WHERE id = ?", [treeID])
         guard let r = rows.first else { return nil }
         let oldUpd = int(r, "ua")
         let day = TimeUtil.dayKey(oldUpd)
+        // 先清理标签引用（其子查询依赖 chunk 行仍然存在），再删附件与数据行
+        try removeTagRefs(treeIDs: [treeID])
         for a in try chunkAttachments(ofTree: treeID) { Self.removeAttachmentIfExists(a) }
         try run("DELETE FROM chunk WHERE maintree_id = ?", [treeID])
         try run("DELETE FROM maintree WHERE id = ?", [treeID])
+        try cleanupOrphanTags()
         return MutationInfo(treeID: treeID, chunkID: nil, newTree: false, oldDay: day, newDay: day)
     }
 
@@ -525,6 +531,7 @@ final class DataStore {
         guard let ci = try chunkInfo(chunkID) else { return nil }
         let treeID = ci.treeID
         let oldUpd = try treeUpdatedMs(treeID)
+        try run("DELETE FROM item_tag WHERE item_type = 'chunk' AND item_id = ?", [chunkID])
         try run("DELETE FROM chunk WHERE id = ?", [chunkID])
         Self.removeAttachmentIfExists(ci.attachment)
 
@@ -538,11 +545,14 @@ final class DataStore {
         let remainCount = int(rr, "cnt")
         if remainCount == 0 {
             let day = TimeUtil.dayKey(oldUpd)
+            try run("DELETE FROM item_tag WHERE item_type = 'tree' AND item_id = ?", [treeID])
             try run("DELETE FROM maintree WHERE id = ?", [treeID])
+            try cleanupOrphanTags()
             return MutationInfo(treeID: treeID, chunkID: chunkID, newTree: false, oldDay: day, newDay: day)
         }
         let newUpd = int(rr, "ua")
         try run("UPDATE maintree SET updated_at = ? WHERE id = ?", [newUpd, treeID])
+        try cleanupOrphanTags()
         return MutationInfo(
             treeID: treeID,
             chunkID: chunkID,
@@ -586,7 +596,8 @@ final class DataStore {
         )
         summary.chunkCount = Int(cntRows.first.map { int($0, "c") } ?? 0)
 
-        // 清理图片附件，再级联删除 chunk 与 maintree
+        // 清理标签引用（子查询依赖 chunk 行仍存在），再清理图片附件，最后级联删除 chunk 与 maintree
+        try removeTagRefs(treeIDs: summary.treeIDs)
         let attRows = try query(
             "SELECT attachment AS at FROM chunk WHERE maintree_id IN (\(existPH)) AND attachment != ''",
             existParams
@@ -596,6 +607,7 @@ final class DataStore {
         }
         try run("DELETE FROM chunk WHERE maintree_id IN (\(existPH))", existParams)
         try run("DELETE FROM maintree WHERE id IN (\(existPH))", existParams)
+        try cleanupOrphanTags()
         return summary
     }
 
@@ -606,6 +618,29 @@ final class DataStore {
         let ids = rows.map { str($0, "id") }
         guard !ids.isEmpty else { return TreeDeleteSummary() }
         return try deleteTrees(ids)
+    }
+
+    /// 删除一组树在 item_tag 中的全部标签引用（树自身 + 其全部分段）。
+    /// 必须在删除 chunk/maintree 数据行之前调用：子查询依赖 chunk 行仍然存在。
+    private func removeTagRefs(treeIDs: [String]) throws {
+        guard !treeIDs.isEmpty else { return }
+        let ph = treeIDs.map { _ in "?" }.joined(separator: ",")
+        let params: [Any?] = treeIDs + treeIDs
+        try run(
+            """
+            DELETE FROM item_tag WHERE
+              (item_type = 'tree' AND item_id IN (\(ph)))
+              OR (item_type = 'chunk' AND item_id IN (
+                    SELECT id FROM chunk WHERE maintree_id IN (\(ph))
+              ))
+            """,
+            params
+        )
+    }
+
+    /// 清理没有任何引用的孤儿标签（删除记录后避免标签云出现幽灵标签/虚高计数）
+    private func cleanupOrphanTags() throws {
+        try run("DELETE FROM tag WHERE id NOT IN (SELECT DISTINCT tag_id FROM item_tag)")
     }
 
     /// 尽力清理附件文件（仅允许删除 images/ 目录内的文件，防止误删其它内容）
@@ -629,6 +664,8 @@ final class DataStore {
         )
         let t = countRows.first.map { int($0, "t") } ?? 0
         let c = countRows.first.map { int($0, "c") } ?? 0
+        try run("DELETE FROM item_tag")
+        try run("DELETE FROM tag")
         try run("DELETE FROM chunk")
         try run("DELETE FROM maintree")
         try? FileManager.default.removeItem(at: AppPaths.imagesRootURL)
@@ -660,14 +697,19 @@ final class DataStore {
     func searchChunks(keyword: String) throws -> [SearchResult] {
         let term = keyword.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !term.isEmpty else { return [] }
-        let pattern = "%\(term)%"
+        // 转义 LIKE 通配符，使 % / _ 按字面量匹配（否则搜索 "50%" 会命中全部记录）
+        let escaped = term
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "%", with: "\\%")
+            .replacingOccurrences(of: "_", with: "\\_")
+        let pattern = "%\(escaped)%"
         let rows = try query(
             """
             SELECT c.id AS cid, c.maintree_id AS tid, c.content, c.source_app AS sa,
                    c.updated_at AS cua, m.updated_at AS tua, m.title
             FROM chunk c
             JOIN maintree m ON m.id = c.maintree_id
-            WHERE LOWER(c.content) LIKE ? OR LOWER(m.title) LIKE ?
+            WHERE LOWER(c.content) LIKE ? ESCAPE '\\' OR LOWER(m.title) LIKE ? ESCAPE '\\'
             ORDER BY m.updated_at DESC, c.updated_at DESC
             LIMIT 200
             """,

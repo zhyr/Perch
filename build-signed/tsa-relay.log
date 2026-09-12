@@ -1,0 +1,4 @@
+[relay] 127.0.0.1:9911 -> http://17.157.80.35/ts01 host=timestamp.apple.com proxy=False
+[relay] POST 77B -> 200 4311B
+[relay] POST 77B -> 200 4311B
+[relay] POST 76B -> 200 4310B

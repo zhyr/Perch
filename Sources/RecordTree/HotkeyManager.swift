@@ -12,7 +12,10 @@ final class HotkeyManager {
 
     private init() {}
 
-    func register(keyCode: UInt32, modifiers: UInt32, action: @escaping () -> Void) {
+    /// 注册全局快捷键。返回是否注册成功——失败通常意味着该组合已被系统或其它应用占用，
+    /// 调用方必须据此给出反馈，避免出现「设置了快捷键却永远不触发」的静默失效。
+    @discardableResult
+    func register(keyCode: UInt32, modifiers: UInt32, action: @escaping () -> Void) -> Bool {
         unregister()
         self.action = action
 
@@ -22,7 +25,7 @@ final class HotkeyManager {
         )
 
         let userData = Unmanaged.passUnretained(self).toOpaque()
-        InstallEventHandler(
+        let installStatus = InstallEventHandler(
             GetApplicationEventTarget(),
             hotKeyCallback,
             1,
@@ -30,12 +33,17 @@ final class HotkeyManager {
             userData,
             &eventHandler
         )
+        guard installStatus == noErr else {
+            self.eventHandler = nil
+            self.action = nil
+            return false
+        }
 
         let hotKeyID = EventHotKeyID(
             signature: FourCharCode("PERH") ?? 0,
             id: 1
         )
-        RegisterEventHotKey(
+        let registerStatus = RegisterEventHotKey(
             keyCode,
             modifiers,
             hotKeyID,
@@ -43,6 +51,17 @@ final class HotkeyManager {
             0,
             &hotKeyRef
         )
+        guard registerStatus == noErr else {
+            // 注册失败：回收事件处理器与回调，避免留下永不触发的死状态
+            if let eventHandler = eventHandler {
+                RemoveEventHandler(eventHandler)
+                self.eventHandler = nil
+            }
+            self.hotKeyRef = nil
+            self.action = nil
+            return false
+        }
+        return true
     }
 
     func unregister() {

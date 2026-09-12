@@ -326,7 +326,7 @@ struct SettingsView: View {
             Group {
                 if aiProvider == 0 {
                     configRow(title: "服务地址", text: $cloudBase, placeholder: "https://yueli.com/api/yueliai/v1/completions")
-                    configRow(title: "API Key", text: $cloudKey, placeholder: "sk-…（yueli.com/admin/openapi-v1-keys 生成）", secure: false)
+                    configRow(title: "API Key", text: $cloudKey, placeholder: "sk-…（yueli.com/admin/openapi-v1-keys 生成）", secure: true)
                     configRow(title: "模型", text: $cloudModel, placeholder: "freemodel")
                 } else if aiProvider == 1 {
                     configRow(title: "服务地址", text: $ollamaBase, placeholder: "http://localhost:11434/v1")
@@ -492,6 +492,12 @@ struct SettingsView: View {
         eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
             let mods = event.modifierFlags.carbonModifiers
             guard mods != 0 else { return event }
+            // 只按 ⌘+字母 会与 ⌘C/⌘V/⌘Q/⌘W 等系统与应用通用快捷键冲突：
+            // 注册为全局热键后会劫持所有应用，因此要求再叠加 ⌃/⌥/⇧ 中至少一个。
+            if mods == UInt32(cmdKey) {
+                model.showToast("请再加一个修饰键（⌃ / ⌥ / ⇧），避免与 ⌘C、⌘Q 等冲突")
+                return nil
+            }
             let code = UInt32(event.keyCode)
             model.updateShortcut(keyCode: code, modifiers: mods)
             isRecording = false
