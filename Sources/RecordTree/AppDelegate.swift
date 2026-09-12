@@ -40,11 +40,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             reason: "\(AppInfo.zhName) 需要及时监听剪贴板变化"
         )
 
-        do {
-            try AppModel.shared.boot()
-            bootOK = true
-        } catch {
-            NSLog("\(AppInfo.zhName) 数据初始化失败: \(error)")
+        // boot 失败自动重试：数据目录在 iCloud 等同步盘上时，启动瞬间可能碰到
+        // 同步引擎短暂锁文件（SQLITE_BUSY），一次失败就永久瘫痪整个会话。
+        // 最多重试 3 次（2s 间隔），成功后照常展示面板。
+        bootWithRetry(attempts: 3) { [weak self] ok in
+            guard let self else { return }
+            self.bootOK = ok
+            if ok {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+                    self?.showPanel()
+                }
+            } else {
+                AppModel.shared.showToast("数据初始化失败，已重试 3 次；请检查数据目录后重启应用")
+            }
         }
 
         setupStatusItem()
@@ -54,10 +62,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         installScrollSuppression()
         monitor.start()
         syncWatcher.start()
+    }
 
-        if bootOK {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
-                self?.showPanel()
+    /// 串行重试 boot；结果在主线程回调（首次立即，失败后间隔 2s）
+    private func bootWithRetry(attempts: Int, completion: @escaping (Bool) -> Void) {
+        do {
+            try AppModel.shared.boot()
+            completion(true)
+        } catch {
+            NSLog("\(AppInfo.zhName) 数据初始化失败（剩余重试 \(attempts - 1) 次）: \(error)")
+            if attempts > 1 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                    self?.bootWithRetry(attempts: attempts - 1, completion: completion)
+                }
+            } else {
+                completion(false)
             }
         }
     }
@@ -77,6 +96,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // 正在编辑文本（TextField / TextEditor 的第一响应者是 NSTextView）时，
             // 把 Esc 交还给编辑器与“取消”按钮，避免一按 Esc 就误隐藏整个面板。
             if self.isEditingText() { return event }
+            // 弹层（删除确认 / 丢弃草稿 / 日期跳转）或多选模式激活时，
+            // Esc 交给弹层“取消”按钮或多选退出逻辑，而不是隐藏整个面板
+            if AppModel.shared.overlayActive { return event }
             self.hidePanel()
             return nil
         }

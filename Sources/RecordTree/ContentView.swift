@@ -17,12 +17,14 @@ private struct ChunkHoverFrameKey: PreferenceKey {
 
 // MARK: - 删除确认
 
-private struct DeleteRequest: Identifiable {
+private struct DeleteRequest: Identifiable, Equatable {
     enum Kind {
         /// 一条或多条整树记录（多选删除时 treeIDs 可能不止一个）
         case trees
         case chunk
         case all
+        /// 清空剪切板历史（只删 clipboard 类型树，笔记保留）
+        case clipboardHistory
     }
     let kind: Kind
     let treeIDs: [String]
@@ -50,6 +52,7 @@ private struct DeleteRequest: Identifiable {
         case .all: return "all"
         case .trees: return treeIDs.sorted().joined(separator: ",")
         case .chunk: return chunkID ?? ""
+        case .clipboardHistory: return "clipboard-history"
         }
     }
 
@@ -66,6 +69,8 @@ private struct DeleteRequest: Identifiable {
             return "将删除该分段，此操作不可恢复。"
         case .all:
             return "将清空全部记录及全部分段，所有数据不可恢复。"
+        case .clipboardHistory:
+            return "将清空全部剪切板历史（自动采集的记录，共 \(treeChunkCount) 条），手工笔记不受影响，此操作不可恢复。"
         }
     }
 }
@@ -78,6 +83,13 @@ struct ContentView: View {
     // 新建 maintree 编辑器
     @State private var newTitle = ""
     @State private var newContent = ""
+
+    // 编辑已有笔记
+    @State private var editingTreeID: String?
+    @State private var editTitle = ""
+    @State private var editContent = ""
+    @FocusState private var editTitleFocused: Bool
+    @FocusState private var editContentFocused: Bool
 
     // 搜索
     @State private var searchText = ""
@@ -117,6 +129,19 @@ struct ContentView: View {
     @State private var resizeStartFrame: NSRect?
     @State private var resizeStartPoint: NSPoint?
 
+    // 标签编辑弹层：tree 或 chunk
+    @State private var tagEditorTarget: TagEditorTarget?
+    @State private var tagEditorText = ""
+
+    struct TagEditorTarget: Identifiable, Equatable {
+        enum Kind: Equatable { case tree, chunk }
+        let kind: Kind
+        let itemID: String
+        /// 展示用标题
+        let title: String
+        var id: String { "\(kind == .tree ? "tree" : "chunk")-\(itemID)" }
+    }
+
     // 列表键盘导航：↑/↓ 选择行，回车复制整棵，空格展开/折叠，x 归档，⌫ 删除
     @State private var keyboardFocusedTreeID: String?
     @State private var keyboardMonitor: Any?
@@ -131,11 +156,23 @@ struct ContentView: View {
                 if model.viewMode == .newRecord {
                     newRecordEditor
                 }
+                if editingTreeID != nil {
+                    editRecordEditor
+                }
                 if model.viewMode == .searchResults {
                     searchResultsView
                 }
                 if model.viewMode == .settings {
                     settingsPanel
+                }
+                if model.viewMode == .clipboardHistory {
+                    clipboardHistoryView
+                }
+                if model.viewMode == .tagCloud {
+                    tagCloudView
+                }
+                if model.viewMode == .tagResults {
+                    tagResultsView
                 }
             }
             .background(listGeometry)
@@ -158,7 +195,7 @@ struct ContentView: View {
                 }
             }
             // 非列表页各自拥有完整的内容与操作区，不再显示列表翻页条
-            if model.viewMode == .list {
+            if model.viewMode == .list, editingTreeID == nil {
                 Divider()
                 if multiSelectActive {
                     multiSelectBar
@@ -195,6 +232,12 @@ struct ContentView: View {
                     .transition(.opacity)
             }
         }
+        .overlay {
+            if let target = tagEditorTarget {
+                tagEditorLayer(target)
+                    .transition(.opacity)
+            }
+        }
         .onChange(of: model.scrollInProgress) { scrolling in
             // 开始滚动即清除旧悬停位，避免滚动结束后残留高亮/预览导致视觉跳变
             guard scrolling else { return }
@@ -214,10 +257,23 @@ struct ContentView: View {
                 resetMultiSelect()
             }
         }
+        .onChange(of: confirmDelete) { _ in syncOverlayState() }
+        .onChange(of: discardNewDraft) { _ in syncOverlayState() }
+        .onChange(of: showDayJump) { _ in syncOverlayState() }
+        .onChange(of: multiSelectActive) { _ in syncOverlayState() }
+        .onChange(of: tagEditorTarget) { _ in syncOverlayState() }
         .animation(.easeOut(duration: 0.15), value: confirmDelete != nil)
         .animation(.easeInOut(duration: 0.18), value: model.lastToast)
         .animation(.easeOut(duration: 0.1), value: hoverPreviewReady)
         .animation(.easeOut(duration: 0.15), value: showDayJump)
+    }
+
+    // MARK: - 弹层状态同步
+
+    /// 把弹层 / 多选激活状态同步给 AppDelegate 的 ESC 监听：
+    /// 激活期间 ESC 交给弹层“取消”按钮或多选退出逻辑，而非隐藏整个面板
+    private func syncOverlayState() {
+        model.overlayActive = confirmDelete != nil || discardNewDraft || showDayJump || multiSelectActive || tagEditorTarget != nil
     }
 
     // MARK: - 删除确认（自定义左对齐弹层，替代系统 alert，保证与整体布局一致）
@@ -379,13 +435,16 @@ struct ContentView: View {
             }
         case .all:
             model.clearAllRecords()
+        case .clipboardHistory:
+            model.clearClipboardHistory()
         }
         confirmDelete = nil
     }
 
-    /// 单个记录/分段删除：按设置决定是否弹确认框；一键清空始终弹确认
+    /// 单个记录/分段删除：按设置决定是否弹确认框；清空全部 / 清空剪切板历史始终弹确认
     private func requestDelete(_ req: DeleteRequest) {
-        if req.kind == .all || model.requireDeleteConfirm {
+        let alwaysConfirm = req.kind == .all || req.kind == .clipboardHistory
+        if alwaysConfirm || model.requireDeleteConfirm {
             confirmDelete = req
         } else {
             performDelete(req)
@@ -619,6 +678,8 @@ struct ContentView: View {
               confirmDelete == nil,
               !discardNewDraft,
               !showDayJump,
+              editingTreeID == nil,
+              chunkDraftTreeID == nil,
               !isTypingInList(),
               !model.rows.isEmpty
         else { return false }
@@ -669,6 +730,35 @@ struct ContentView: View {
                 return true
             case "k":
                 moveKeyboardSelection(-1)
+                return true
+            case "n":
+                // 新建笔记：直接打开编辑器
+                model.showNewRecord()
+                return true
+            case "e":
+                // 编辑当前聚焦的笔记
+                if let id = focusedID {
+                    startEditingTree(id)
+                    return true
+                }
+                return false
+            case "a":
+                // 追加剪切板内容到当前聚焦的笔记
+                if let id = focusedID {
+                    model.appendClipboardToTree(id)
+                    return true
+                }
+                return false
+            case "c":
+                // 复制最新分段内容
+                if let id = focusedID {
+                    model.copyRecord(id)
+                    return true
+                }
+                return false
+            case "t":
+                // 标签云
+                model.showTagCloud()
                 return true
             case "x":
                 if let id = focusedID {
@@ -806,7 +896,7 @@ struct ContentView: View {
         VStack(spacing: 0) {
             titleBar
             // 快捷动作行只在主列表展示，避免在编辑器/设置等场景下出现无关全局操作
-            if model.viewMode == .list {
+            if model.viewMode == .list, editingTreeID == nil {
                 if multiSelectActive {
                     multiSelectHintRow
                 } else {
@@ -865,6 +955,50 @@ struct ContentView: View {
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundColor(.primary)
             Spacer(minLength: 0)
+
+            // 剪切板历史入口（位置 1）
+            Button(action: { model.showClipboardHistory() }) {
+                Image(systemName: "doc.on.clipboard")
+                    .font(.system(size: 12, weight: .medium))
+            }
+            .buttonStyle(.plain)
+            .foregroundColor(.secondary)
+            .focusable(false)
+            .help("剪切板历史（自动捕获的复制记录）")
+
+            // 标签云入口
+            Button(action: { model.showTagCloud() }) {
+                Image(systemName: "tag")
+                    .font(.system(size: 12, weight: .medium))
+            }
+            .buttonStyle(.plain)
+            .foregroundColor(.secondary)
+            .focusable(false)
+            .help("标签云（按数量排序，点击标签筛选记录）")
+
+            // 笔记首页入口：任意页面一键回到主列表（Cella 图标左侧）
+            Button(action: { model.returnToList() }) {
+                Image(nsImage: appIconImage())
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 15, height: 15)
+                    .cornerRadius(3)
+            }
+            .buttonStyle(.plain)
+            .focusable(false)
+            .help("回到笔记首页")
+
+            // Cella 应用入口（位置 2）
+            Button(action: openCellaApp) {
+                Image(nsImage: cellaIconImage())
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 15, height: 15)
+            }
+            .buttonStyle(.plain)
+            .focusable(false)
+            .help("打开 Cella（层隅）")
+
             Button(action: openBrewTaskNote) {
                 Capsule()
                     .fill(Color.black)
@@ -932,10 +1066,16 @@ struct ContentView: View {
             .help("打开搜索界面（⌘F）")
 
             Button(action: { model.showNewRecord() }) {
-                Label("新建记录", systemImage: "doc.badge.plus")
+                Label("新建笔记", systemImage: "doc.badge.plus")
             }
             .keyboardShortcut("n", modifiers: .command)
-            .help("新建一条记录（⌘N）")
+            .help("新建一条笔记（⌘N）")
+
+            Button(action: { model.createNoteFromClipboard() }) {
+                Label("粘贴为笔记", systemImage: "clipboard.badge.plus")
+            }
+            .keyboardShortcut("v", modifiers: [.command, .shift])
+            .help("将剪切板文本一键保存为新笔记（⌘⇧V）")
 
             Button(action: enterMultiSelect) {
                 Label("多选", systemImage: "checkmark.circle")
@@ -987,6 +1127,53 @@ struct ContentView: View {
         return NSImage(size: NSSize(width: 18, height: 18))
     }
 
+    /// Cella 应用图标：从应用包 Resources 加载。
+    /// 注意：该图标是彩色方形图标，不能设 isTemplate（模板渲染只保留 alpha 轮廓，
+    /// 会把整个不透明圆角方形渲染成一块纯黑——已踩坑）。
+    private func cellaIconImage() -> NSImage {
+        if let url = Bundle.main.url(forResource: "CellaIcon", withExtension: "png"),
+           let img = NSImage(contentsOf: url) {
+            return img
+        }
+        // 回退：用与 Cella 图标语义相近的 checklist 符号
+        if let img = NSImage(systemSymbolName: "checklist", accessibilityDescription: "Cella") {
+            return img
+        }
+        return NSImage(size: NSSize(width: 15, height: 15))
+    }
+
+    private func openCellaApp() {
+        let ws = NSWorkspace.shared
+        guard let appURL = ws.urlForApplication(withBundleIdentifier: "com.cella.app") else {
+            // 未安装：退化为在 Finder 中展示工程目录
+            ws.activateFileViewerSelecting([URL(fileURLWithPath: "/Users/yr.z/work/cella")])
+            return
+        }
+
+        let showPanel = Notification.Name("com.cella.app.showPanel")
+        let running = ws.runningApplications.contains { $0.bundleIdentifier == "com.cella.app" }
+        if running {
+            // Cella 是 LSUIElement 应用，对已运行实例 activate 不会显示窗口；
+            // 通过分布式通知让它自己弹出面板
+            DistributedNotificationCenter.default().postNotificationName(
+                showPanel, object: nil, userInfo: nil, deliverImmediately: true
+            )
+        } else {
+            let config = NSWorkspace.OpenConfiguration()
+            ws.openApplication(at: appURL, configuration: config) { _, error in
+                if error != nil {
+                    NSLog("打开 Cella 失败: \(error!.localizedDescription)")
+                }
+            }
+            // 启动完成后补发一次，确保首次启动后面板可见
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+                DistributedNotificationCenter.default().postNotificationName(
+                    showPanel, object: nil, userInfo: nil, deliverImmediately: true
+                )
+            }
+        }
+    }
+
     private func openGitHub() {
         guard let url = URL(string: "https://github.com/zhyr/Perch") else { return }
         NSWorkspace.shared.open(url)
@@ -997,6 +1184,237 @@ struct ContentView: View {
         model.openBrewTaskNote()
     }
 
+    // MARK: - 标签云 / 标签结果 / 标签编辑
+
+    private func pageHeader(title: String, systemImage: String, backTitle: String, onBack: @escaping () -> Void) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: systemImage)
+                .font(.system(size: 13))
+                .foregroundColor(.secondary)
+            Text(title)
+                .font(.system(size: 14, weight: .semibold))
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer(minLength: 0)
+            Button(backTitle, action: onBack)
+                .keyboardShortcut(.defaultAction)
+                .controlSize(.small)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 9)
+    }
+
+    private func tagFontSize(total: Int, maxTotal: Int) -> CGFloat {
+        guard maxTotal > 1 else { return 13 }
+        let ratio = sqrt(Double(total) / Double(maxTotal))
+        return 12 + CGFloat(ratio * 12)
+    }
+
+    /// 标签云：按引用条数倒序，字号随数量缩放，点击筛选该标签的全部记录
+    private var tagCloudView: some View {
+        VStack(spacing: 0) {
+            pageHeader(title: "标签云", systemImage: "tag", backTitle: "返回") {
+                model.returnToList()
+            }
+            Divider()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 10) {
+                    if model.tagCloudItems.isEmpty {
+                        VStack(spacing: 10) {
+                            Image(systemName: "tag.slash")
+                                .font(.system(size: 28))
+                                .foregroundColor(.secondary)
+                            Text("暂无标签")
+                                .font(.title3)
+                            Text("右键记录或分段可手工打标签；\n在设置中配置 AI 后可一键自动打标签。")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                                .multilineTextAlignment(.center)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.top, 120)
+                    } else {
+                        let maxTotal = model.tagCloudItems.first?.total ?? 1
+                        LazyVGrid(
+                            columns: [GridItem(.adaptive(minimum: 56, maximum: 260), spacing: 8)],
+                            alignment: .leading,
+                            spacing: 8
+                        ) {
+                            ForEach(model.tagCloudItems, id: \.name) { entry in
+                                Button {
+                                    model.openTag(entry.name)
+                                } label: {
+                                    HStack(spacing: 4) {
+                                        Text(entry.name)
+                                            .font(.system(size: tagFontSize(total: entry.total, maxTotal: maxTotal)))
+                                            .lineLimit(1)
+                                        Text("\(entry.total)")
+                                            .font(.caption2)
+                                            .foregroundColor(.secondary)
+                                    }
+                                    .padding(.horizontal, 9)
+                                    .padding(.vertical, 4)
+                                    .background(
+                                        Capsule().fill(Color.accentColor.opacity(0.08))
+                                    )
+                                }
+                                .buttonStyle(.plain)
+                                .help("记录 \(entry.treeCount) 条 · 分段 \(entry.chunkCount) 个，点击查看")
+                            }
+                        }
+                        Text("共 \(model.tagCloudItems.count) 个标签 · 按数量排序")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 14)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(nsColor: .windowBackgroundColor))
+    }
+
+    /// 点击某个标签后的结果页：该标签下的全部记录
+    private var tagResultsView: some View {
+        VStack(spacing: 0) {
+            pageHeader(
+                title: "标签：\(model.selectedTagName) · \(model.tagResults.count) 条",
+                systemImage: "tag.fill",
+                backTitle: "标签云"
+            ) {
+                model.backToTagCloud()
+            }
+            Divider()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 2) {
+                    if model.tagResults.isEmpty {
+                        Text("该标签下暂无记录")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                            .frame(maxWidth: .infinity)
+                            .padding(.top, 80)
+                    }
+                    ForEach(model.tagResults) { row in
+                        tagResultRow(row)
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(nsColor: .windowBackgroundColor))
+    }
+
+    private func tagResultRow(_ row: TreeRowVM) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(row.titleText ?? row.preview)
+                .font(.system(size: 13, weight: .medium))
+                .lineLimit(1)
+                .truncationMode(.tail)
+            HStack(spacing: 6) {
+                Text(row.caption)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+                if !row.tags.isEmpty {
+                    tagChips(row.tags, compact: true)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(
+            RoundedRectangle(cornerRadius: 6)
+                .fill(Color.secondary.opacity(0.05))
+        )
+        .onTapGesture {
+            model.openTreeFromTagResult(row.id)
+        }
+        .contextMenu {
+            Button("在主列表中定位", action: { model.openTreeFromTagResult(row.id) })
+            Button("复制整棵记录", action: { model.copyTree(row.id) })
+        }
+    }
+
+    private func openTagEditorForTree(_ treeID: String, title: String) {
+        tagEditorText = model.treeTagNames(treeID).joined(separator: "，")
+        tagEditorTarget = TagEditorTarget(kind: .tree, itemID: treeID, title: title)
+    }
+
+    private func openTagEditorForChunk(_ chunkID: String, title: String) {
+        tagEditorText = model.chunkTagNames(chunkID).joined(separator: "，")
+        tagEditorTarget = TagEditorTarget(kind: .chunk, itemID: chunkID, title: title)
+    }
+
+    private func saveTagEditor() {
+        guard let target = tagEditorTarget else { return }
+        let names = tagEditorText
+            .split(whereSeparator: { "，,、 ".contains($0) })
+            .map { String($0) }
+        switch target.kind {
+        case .tree:
+            model.setTreeTags(target.itemID, names: names)
+        case .chunk:
+            model.setChunkTags(target.itemID, names: names)
+        }
+        tagEditorTarget = nil
+        if model.viewMode == .tagResults {
+            // 结果页数据可能因标签变化而变化，重取
+            model.openTag(model.selectedTagName)
+        }
+    }
+
+    @FocusState private var tagEditorFocused: Bool
+
+    private func tagEditorLayer(_ target: TagEditorTarget) -> some View {
+        ZStack {
+            Color.black.opacity(0.12)
+                .onTapGesture { tagEditorTarget = nil }
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 6) {
+                    Image(systemName: "tag")
+                        .font(.system(size: 12))
+                        .foregroundColor(.accentColor)
+                    Text(target.kind == .tree ? "编辑记录标签" : "编辑分段标签")
+                        .font(.system(size: 14, weight: .semibold))
+                    Spacer(minLength: 0)
+                }
+                Text(target.title)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                TextField("多个标签用逗号或空格分隔", text: $tagEditorText)
+                    .textFieldStyle(.roundedBorder)
+                    .focused($tagEditorFocused)
+                    .onSubmit { saveTagEditor() }
+                HStack {
+                    Spacer(minLength: 0)
+                    Button("取消") { tagEditorTarget = nil }
+                        .keyboardShortcut(.cancelAction)
+                    Button("保存") { saveTagEditor() }
+                        .keyboardShortcut(.defaultAction)
+                }
+            }
+            .padding(14)
+            .background(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(Color(nsColor: .windowBackgroundColor))
+                    .shadow(color: .black.opacity(0.18), radius: 14, y: 4)
+            )
+            .padding(.horizontal, 28)
+        }
+        .onAppear {
+            DispatchQueue.main.async { tagEditorFocused = true }
+        }
+    }
+
     // MARK: - 主内容区：列表 / 空状态
 
     private var listArea: some View {
@@ -1005,12 +1423,12 @@ struct ContentView: View {
             if model.rows.isEmpty {
                 VStack(spacing: 12) {
                     Spacer()
-                    Image(systemName: "doc.on.clipboard")
+                    Image(systemName: "note.text")
                         .font(.system(size: 30))
                         .foregroundColor(.secondary)
-                    Text("暂无记录")
+                    Text("暂无笔记")
                         .font(.title3)
-                    Text("在任意应用中复制文字或图片，会自动按 60 秒窗口归并成一条记录；也可以手动新建。")
+                    Text("点击「新建笔记」手工添加笔记；剪切板自动捕获的内容请查看剪切板历史。")
                         .font(.caption)
                         .foregroundColor(.secondary)
                         .multilineTextAlignment(.center)
@@ -1018,7 +1436,7 @@ struct ContentView: View {
                     Button {
                         model.showNewRecord()
                     } label: {
-                        Label("新建一条记录", systemImage: "doc.badge.plus")
+                        Label("新建一条笔记", systemImage: "doc.badge.plus")
                     }
                     .controlSize(.small)
                     Text("快捷键：⌘N 新建 · ⌘F 搜索 · 列表内 ↑↓ 选择 / 回车复制 / 空格展开 / X 归档 / ⌫ 删除")
@@ -1069,6 +1487,9 @@ struct ContentView: View {
                                     markKeyboardFocus(row.id)
                                     model.copyChunk(cid)
                                 },
+                                onEditTree: {
+                                    startEditingTree(row.id)
+                                },
                                 onArchive: {
                                     markKeyboardFocus(row.id)
                                     model.toggleArchiveTree(row.id)
@@ -1103,6 +1524,11 @@ struct ContentView: View {
                                     chunkDraftTreeID = row.id
                                     chunkDraftText = ""
                                 },
+                                onKeepAddingChunk: {
+                                    if model.manualAppendToTree(row.id, content: chunkDraftText, keepAdding: true) {
+                                        chunkDraftText = ""
+                                    }
+                                },
                                 onSaveChunk: {
                                     if model.manualAppendToTree(row.id, content: chunkDraftText) {
                                         chunkDraftTreeID = nil
@@ -1112,6 +1538,17 @@ struct ContentView: View {
                                 onCancelChunk: {
                                     chunkDraftTreeID = nil
                                     chunkDraftText = ""
+                                },
+                                onEditTags: {
+                                    openTagEditorForTree(row.id, title: row.titleText ?? row.preview)
+                                },
+                                onAITag: {
+                                    model.aiTagTree(row.id)
+                                },
+                                onEditChunkTags: { cid in
+                                    if let chunk = row.chunks.first(where: { $0.id == cid }) {
+                                        openTagEditorForChunk(cid, title: chunk.preview)
+                                    }
                                 },
                                 onHoverChanged: { hov in
                                     guard hoverEnabled else { return }
@@ -1250,12 +1687,63 @@ struct ContentView: View {
         newContentFocused = false
     }
 
+    /// 把剪切板文本追加到编辑器内容末尾（新建 / 编辑共用；区别于 ⌘V 的光标处粘贴）
+    private func appendClipboard(to target: inout String) {
+        if let text = model.clipboardText() {
+            target += (target.isEmpty ? "" : "\n") + text
+        }
+    }
+
+    private func saveNewRecord() {
+        if model.createNewRecord(title: newTitle, content: newContent) {
+            newTitle = ""
+            newContent = ""
+            newTitleFocused = false
+            newContentFocused = false
+        }
+    }
+
+    private func saveEditRecord() {
+        if let tid = editingTreeID,
+           model.updateRecord(treeID: tid, title: editTitle, content: editContent) {
+            cancelEditing()
+        }
+    }
+
+    /// 进入笔记编辑：预填标题与首个分段内容
+    private func startEditingTree(_ treeID: String) {
+        guard let row = model.rows.first(where: { $0.id == treeID }) else { return }
+        editingTreeID = treeID
+        editTitle = row.tree.title
+        let firstChunk = row.tree.chunks.sorted { $0.createdAtMs < $1.createdAtMs }.first
+        editContent = firstChunk?.content ?? ""
+        editTitleFocused = false
+        editContentFocused = false
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+            editTitleFocused = true
+        }
+    }
+
+    private func cancelEditing() {
+        editingTreeID = nil
+        editTitle = ""
+        editContent = ""
+    }
+
     private var newRecordEditor: some View {
         VStack(spacing: 0) {
             HStack {
-                Text("新建记录")
+                Text("新建笔记")
                     .font(.headline)
                 Spacer()
+                Button {
+                    appendClipboard(to: &newContent)
+                } label: {
+                    Label("追加剪切板", systemImage: "doc.on.clipboard")
+                }
+                .controlSize(.small)
+                .keyboardShortcut("v", modifiers: [.command, .shift])
+                .help("将剪切板文本追加到内容末尾（⌘⇧V）；⌘V 则粘贴到光标处")
                 Button("取消") {
                     cancelNewRecordEditing()
                 }
@@ -1315,6 +1803,75 @@ struct ContentView: View {
                 newTitleFocused = true
             }
         }
+    }
+
+    // MARK: - 编辑已有笔记
+
+    private var editRecordEditor: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("编辑笔记")
+                    .font(.headline)
+                Spacer()
+                Button {
+                    appendClipboard(to: &editContent)
+                } label: {
+                    Label("追加剪切板", systemImage: "doc.on.clipboard")
+                }
+                .controlSize(.small)
+                .keyboardShortcut("v", modifiers: [.command, .shift])
+                .help("将剪切板文本追加到内容末尾（⌘⇧V）；⌘V 则粘贴到光标处")
+                Button("取消") {
+                    cancelEditing()
+                }
+                .keyboardShortcut(.cancelAction)
+                .help("放弃修改并返回（ESC）")
+            }
+            .padding(.horizontal, 12)
+            .padding(.top, 12)
+            .padding(.bottom, 8)
+
+            VStack(spacing: 10) {
+                TextField("标题（可选）", text: $editTitle)
+                    .textFieldStyle(.roundedBorder)
+                    .focused($editTitleFocused)
+                    .onSubmit { editContentFocused = true }
+
+                ZStack(alignment: .topLeading) {
+                    TextEditor(text: $editContent)
+                        .font(.system(size: 13))
+                        .frame(minHeight: 180)
+                        .focused($editContentFocused)
+                    if editContent.isEmpty {
+                        Text("在此输入笔记内容…")
+                            .font(.system(size: 13))
+                            .foregroundColor(.secondary)
+                            .padding(.top, 6)
+                            .padding(.leading, 4)
+                            .allowsHitTesting(false)
+                    }
+                }
+            }
+            .padding(.horizontal, 12)
+
+            HStack {
+                Spacer()
+                Button("保存") {
+                    if let tid = editingTreeID,
+                       model.updateRecord(treeID: tid, title: editTitle, content: editContent) {
+                        cancelEditing()
+                    }
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(editContent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+            .padding(.horizontal, 12)
+            .padding(.bottom, 12)
+            .padding(.top, 8)
+
+            Spacer()
+        }
+        .background(Color(nsColor: .windowBackgroundColor))
     }
 
     // MARK: - 搜索区
@@ -1494,6 +2051,157 @@ struct ContentView: View {
         )
         .background(Color(nsColor: .windowBackgroundColor))
     }
+
+    // MARK: - 剪切板历史
+
+    private var clipboardHistoryView: some View {
+        VStack(spacing: 0) {
+            clipboardHistoryHeader
+            Divider()
+
+            if model.clipboardHistoryItems.isEmpty {
+                VStack(spacing: 10) {
+                    Spacer()
+                    Image(systemName: "doc.on.clipboard")
+                        .font(.system(size: 30))
+                        .foregroundColor(.secondary)
+                    Text("暂无剪切板历史")
+                        .font(.title3)
+                    Text("在任意应用中复制文字或图片，会自动记录到剪切板历史。")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 24)
+                    Spacer()
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 2) {
+                        ForEach(model.clipboardHistoryItems) { item in
+                            clipboardHistoryRow(item)
+                        }
+                        if model.clipboardHistoryHasMore {
+                            Button("加载更多") {
+                                model.loadMoreClipboardHistory()
+                            }
+                            .controlSize(.small)
+                            .padding(.vertical, 8)
+                            .frame(maxWidth: .infinity)
+                        }
+                    }
+                    .padding(8)
+                }
+            }
+        }
+        .background(Color(nsColor: .windowBackgroundColor))
+    }
+
+    private var clipboardHistoryHeader: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "doc.on.clipboard")
+                .font(.system(size: 13))
+                .foregroundColor(.secondary)
+            Text("剪切板历史")
+                .font(.system(size: 14, weight: .semibold))
+            Spacer(minLength: 0)
+            Text("共 \(model.clipboardHistoryTotal) 条")
+                .font(.caption)
+                .foregroundColor(.secondary)
+            if model.clipboardHistoryTotal > 0 {
+                Button("清空", role: .destructive) {
+                    requestDelete(
+                        DeleteRequest(
+                            kind: .clipboardHistory,
+                            treeID: "",
+                            chunkID: nil,
+                            treeChunkCount: model.clipboardHistoryTotal
+                        )
+                    )
+                }
+                .controlSize(.small)
+                .help("清空全部剪切板历史（手工笔记不受影响，始终需确认）")
+            }
+            Button("返回") {
+                model.exitClipboardHistory()
+            }
+            .keyboardShortcut(.cancelAction)
+            .controlSize(.small)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 9)
+    }
+
+    private func clipboardHistoryRow(_ item: ClipboardHistoryItem) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            VStack(alignment: .leading, spacing: 2) {
+                if item.isImage {
+                    HStack(spacing: 4) {
+                        Image(systemName: "photo")
+                            .font(.system(size: 10))
+                            .foregroundColor(.secondary)
+                        Text(item.content)
+                            .font(.system(size: 12))
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
+                } else {
+                    Text(item.content)
+                        .font(.system(size: 12))
+                        .lineLimit(2)
+                        .truncationMode(.tail)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Text(clipboardHistoryCaption(item))
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            Button {
+                model.archiveClipboardItemAsNote(item)
+            } label: {
+                Image(systemName: "square.and.arrow.down")
+                    .font(.system(size: 11))
+            }
+            .buttonStyle(.plain)
+            .focusable(false)
+            .foregroundColor(.secondary)
+            .help("归档为笔记（新建一条笔记记录，原历史条目保留）")
+            .padding(.top, 2)
+
+            Button {
+                model.copyClipboardItem(item)
+            } label: {
+                Image(systemName: "doc.on.doc")
+                    .font(.system(size: 11))
+            }
+            .buttonStyle(.plain)
+            .focusable(false)
+            .foregroundColor(.secondary)
+            .help("复制该条记录")
+            .padding(.top, 2)
+        }
+        .padding(.vertical, 5)
+        .padding(.horizontal, 8)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            model.copyClipboardItem(item)
+        }
+        .contextMenu {
+            Button("复制该条记录") { model.copyClipboardItem(item) }
+            Button("归档为笔记") { model.archiveClipboardItemAsNote(item) }
+        }
+    }
+
+    private func clipboardHistoryCaption(_ item: ClipboardHistoryItem) -> String {
+        var parts: [String] = []
+        if !item.sourceApp.isEmpty {
+            parts.append("来自 \(item.sourceApp)")
+        }
+        parts.append(TimeUtil.displayTime(item.updatedAtMs))
+        return parts.joined(separator: " · ")
+    }
 }
 
 // MARK: - 丢弃草稿确认弹层
@@ -1563,6 +2271,7 @@ private struct DeleteConfirmDialog: View {
             return request.treeIDs.count > 1 ? "删除所选 \(request.treeIDs.count) 条记录？" : "删除该记录？"
         case .chunk: return "删除该分段？"
         case .all: return "清空全部数据？"
+        case .clipboardHistory: return "清空剪切板历史？"
         }
     }
 
@@ -1707,12 +2416,17 @@ private struct TreeRowView: View {
     let onCopyTree: () -> Void
     let onCopyRecord: () -> Void
     let onCopyChunk: (String) -> Void
+    let onEditTree: () -> Void
     let onArchive: () -> Void
     let onDeleteTree: () -> Void
     let onDeleteChunk: (String) -> Void
     let onStartAddChunk: () -> Void
+    let onKeepAddingChunk: () -> Void
     let onSaveChunk: () -> Void
     let onCancelChunk: () -> Void
+    let onEditTags: () -> Void
+    let onAITag: () -> Void
+    let onEditChunkTags: (String) -> Void
     let onHoverChanged: (Bool) -> Void
     let onChunkHover: (String?, Bool) -> Void
 
@@ -1746,25 +2460,46 @@ private struct TreeRowView: View {
                 .focusable(false)
                 .padding(.top, 4)
 
-                // 左侧主内容：多选模式下点击切换勾选；平时单击复制整棵记录
+                // 左侧主内容：多选模式下点击切换勾选；平时单击展开/折叠（不再直接复制，避免误操作）
                 VStack(alignment: .leading, spacing: 3) {
                     primaryText
                     Text(row.caption)
                         .font(.caption)
                         .foregroundColor(.secondary)
                         .strikethrough(row.tree.isArchived)
+                    if !row.tags.isEmpty && !isMultiSelecting {
+                        tagChips(row.tags, compact: false)
+                    }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .contentShape(Rectangle())
-                .onTapGesture(perform: isMultiSelecting ? onToggleSelect : onCopyTree)
+                .onTapGesture(perform: isMultiSelecting ? onToggleSelect : onToggle)
                 .help(isMultiSelecting
                       ? (isSelected ? "已选中：点击可取消勾选（空格）" : "点击勾选该记录（空格）")
-                      : "单击复制整棵记录（标题 + 全部分段）；右键可展开 / 归档 / 删除等")
+                      : "单击展开/折叠；复制请使用右侧操作按钮")
 
                 // 行内操作仅在悬停 / 展开 / 键盘选中时展示，避免日常浏览被按钮占满
                 // 多选模式下隐藏单行操作，避免与批量勾选语义冲突（右键菜单仍可用）
                 if showActions && !isMultiSelecting {
                     HStack(spacing: 8) {
+                        Button(action: onCopyTree) {
+                            Image(systemName: "doc.on.doc")
+                                .font(.system(size: 12))
+                        }
+                        .buttonStyle(.plain)
+                        .focusable(false)
+                        .foregroundColor(.secondary)
+                        .help("复制整棵记录（标题 + 全部分段）")
+
+                        Button(action: onEditTree) {
+                            Image(systemName: "pencil")
+                                .font(.system(size: 11))
+                        }
+                        .buttonStyle(.plain)
+                        .focusable(false)
+                        .foregroundColor(.secondary)
+                        .help("编辑该笔记")
+
                         Button(action: onArchive) {
                             Image(systemName: row.tree.isArchived ? "archivebox.fill" : "archivebox")
                                 .font(.system(size: 12))
@@ -1853,6 +2588,11 @@ private struct TreeRowView: View {
         Button("复制整棵记录", action: onCopyTree)
         Button("复制最新分段内容", action: onCopyRecord)
             .disabled(row.tree.latest == nil)
+        Button("编辑笔记", action: onEditTree)
+        Divider()
+        Button("编辑标签…", action: onEditTags)
+        Button("AI 打标签", action: onAITag)
+            .help("调用设置中配置的 AI 服务自动生成标签")
         Divider()
         Button("追加分段…", action: onStartAddChunk)
         Button(row.tree.isArchived ? "取消归档" : "归档", action: onArchive)
@@ -1890,33 +2630,38 @@ private struct TreeRowView: View {
         let hov = hoveredChunkID == c.id
         let highlighted = highlightedChunkID == c.id
         return HStack(alignment: .top, spacing: 6) {
-            Button {
-                onCopyChunk(c.id)
-            } label: {
-                HStack(alignment: .top, spacing: 6) {
-                    Circle()
-                        .fill(Color.accentColor.opacity(0.55))
-                        .frame(width: 5, height: 5)
-                        .padding(.top, 7)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(c.preview)
-                            .font(.system(size: 12))
-                            .lineLimit(1)
-                            .truncationMode(.tail)
-                        Text(c.caption)
-                            .font(.caption2)
-                            .foregroundColor(.secondary)
-                    }
+            HStack(alignment: .top, spacing: 6) {
+                Circle()
+                    .fill(Color.accentColor.opacity(0.55))
+                    .frame(width: 5, height: 5)
+                    .padding(.top, 7)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(c.preview)
+                        .font(.system(size: 12))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    Text(c.caption)
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
                 }
-                .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
-            .focusable(false)
-            .help("复制该分段内容")
+            .contentShape(Rectangle())
 
             Spacer(minLength: 0)
 
             if hov {
+                Button {
+                    onCopyChunk(c.id)
+                } label: {
+                    Image(systemName: "doc.on.doc")
+                        .font(.system(size: 10))
+                }
+                .buttonStyle(.plain)
+                .focusable(false)
+                .foregroundColor(.secondary)
+                .help("复制该分段内容")
+                .padding(.top, 2)
+
                 Button {
                     onDeleteChunk(c.id)
                 } label: {
@@ -1941,6 +2686,7 @@ private struct TreeRowView: View {
         .onHover { hov in onChunkHover(c.id, hov) }
         .contextMenu {
             Button("复制该分段", action: { onCopyChunk(c.id) })
+            Button("编辑标签…", action: { onEditChunkTags(c.id) })
             Button("删除该分段", role: .destructive, action: { onDeleteChunk(c.id) })
                 .disabled(row.chunks.count <= 1)
         }
@@ -2010,3 +2756,25 @@ private struct TrafficLightButton: View {
     }
 }
 
+
+// MARK: - 行内小标签串（ContentView 与 TreeRowView 共用）
+
+private func tagChips(_ tags: [String], compact: Bool) -> some View {
+    let shown = tags.prefix(compact ? 3 : 4)
+    return HStack(spacing: 3) {
+        ForEach(Array(shown), id: \.self) { name in
+            Text(name)
+                .font(.system(size: 9))
+                .foregroundColor(.accentColor)
+                .padding(.horizontal, 5)
+                .padding(.vertical, 1)
+                .background(Capsule().fill(Color.accentColor.opacity(0.10)))
+                .lineLimit(1)
+        }
+        if tags.count > shown.count {
+            Text("+\(tags.count - shown.count)")
+                .font(.system(size: 9))
+                .foregroundColor(.secondary)
+        }
+    }
+}

@@ -19,12 +19,15 @@ struct ChunkRec: Identifiable {
 struct TreeRec: Identifiable {
     let id: String
     let title: String
+    /// "note" = 手工笔记；"clipboard" = 自动捕获的剪切板记录
+    let kind: String
     let archivedAtMs: Int64?
     let createdAtMs: Int64
     let updatedAtMs: Int64
     let chunks: [ChunkRec]
 
     var isArchived: Bool { (archivedAtMs ?? 0) > 0 }
+    var isNote: Bool { kind == "note" }
     var latest: ChunkRec? { chunks.max { $0.updatedAtMs < $1.updatedAtMs } }
 }
 
@@ -50,4 +53,18 @@ struct MutationInfo {
     var affectedDays: [String] {
         oldDay == newDay ? [newDay] : [newDay, oldDay]
     }
+}
+
+/// 剪切板历史条目（按更新时间倒序的单个 chunk）
+struct ClipboardHistoryItem: Identifiable {
+    let id: String
+    let treeID: String
+    let content: String
+    let attachment: String
+    let sourceApp: String
+    let createdAtMs: Int64
+    let updatedAtMs: Int64
+    let lastCopiedMs: Int64?
+
+    var isImage: Bool { !attachment.isEmpty }
 }

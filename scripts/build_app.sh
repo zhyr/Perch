@@ -4,8 +4,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 echo "==> swift build (release)"
-swift build -c release --product RecordTree 2>&1 | tail -5
-BIN_PATH="$(swift build -c release --show-bin-path)/RecordTree"
+swift build -c release --disable-sandbox --product RecordTree 2>&1 | tail -5
+BIN_PATH="$(swift build -c release --disable-sandbox --show-bin-path)/RecordTree"
 
 APP_NAME="Perch"
 DEST=""

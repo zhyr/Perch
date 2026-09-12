@@ -11,6 +11,19 @@ struct SettingsView: View {
     @State private var isRecording = false
     @State private var eventMonitor: Any?
 
+    // AI 打标签配置（键与 AppModel.AIConfigKey 保持一致）
+    @AppStorage(AppModel.AIConfigKey.provider) private var aiProvider = 0
+    @AppStorage(AppModel.AIConfigKey.cloudBase) private var cloudBase = AIProviderPreset.cloud.defaultBaseURL
+    @AppStorage(AppModel.AIConfigKey.cloudKey) private var cloudKey = ""
+    @AppStorage(AppModel.AIConfigKey.cloudModel) private var cloudModel = AIProviderPreset.cloud.defaultModel
+    @AppStorage(AppModel.AIConfigKey.ollamaBase) private var ollamaBase = AIProviderPreset.ollama.defaultBaseURL
+    @AppStorage(AppModel.AIConfigKey.ollamaModel) private var ollamaModel = AIProviderPreset.ollama.defaultModel
+    @AppStorage(AppModel.AIConfigKey.mlxBase) private var mlxBase = AIProviderPreset.mlx.defaultBaseURL
+    @AppStorage(AppModel.AIConfigKey.mlxModel) private var mlxModel = AIProviderPreset.mlx.defaultModel
+
+    @State private var aiTestResult: String?
+    @State private var isTestingAI = false
+
     var body: some View {
         VStack(spacing: 0) {
             header
@@ -20,6 +33,7 @@ struct SettingsView: View {
                 VStack(alignment: .leading, spacing: 26) {
                     shortcutSection
                     recordingSection
+                    aiSection
                     generalSection
                     syncSection
                 }
@@ -214,6 +228,7 @@ struct SettingsView: View {
         VStack(alignment: .leading, spacing: 8) {
             sectionHeader("通用")
 
+
             HStack(spacing: 10) {
                 Image(systemName: "exclamationmark.triangle")
                     .font(.system(size: 12))
@@ -276,6 +291,129 @@ struct SettingsView: View {
                 RoundedRectangle(cornerRadius: 7, style: .continuous)
                     .fill(Color.red.opacity(0.07))
             )
+        }
+    }
+
+    // MARK: - AI 自动打标签
+
+    private var aiSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            sectionHeader("AI 自动打标签")
+
+            // 服务类型
+            HStack(spacing: 10) {
+                Image(systemName: "cpu")
+                    .font(.system(size: 12))
+                    .foregroundColor(.secondary)
+                    .frame(width: 16)
+                Text("服务类型")
+                    .font(.system(size: 13))
+                Spacer(minLength: 8)
+                Picker("", selection: $aiProvider) {
+                    Text("云端 API").tag(0)
+                    Text("Ollama").tag(1)
+                    Text("MLX").tag(2)
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 220)
+                .labelsHidden()
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(Color.secondary.opacity(0.08)))
+
+            // 当前预设的字段
+            Group {
+                if aiProvider == 0 {
+                    configRow(title: "服务地址", text: $cloudBase, placeholder: "https://yueli.com/api/yueliai/v1/completions")
+                    configRow(title: "API Key", text: $cloudKey, placeholder: "sk-…（yueli.com/admin/openapi-v1-keys 生成）", secure: false)
+                    configRow(title: "模型", text: $cloudModel, placeholder: "freemodel")
+                } else if aiProvider == 1 {
+                    configRow(title: "服务地址", text: $ollamaBase, placeholder: "http://localhost:11434/v1")
+                    configRow(title: "模型", text: $ollamaModel, placeholder: "qwen3.5")
+                } else {
+                    configRow(title: "服务地址", text: $mlxBase, placeholder: "http://127.0.0.1:8080/v1")
+                    configRow(title: "模型", text: $mlxModel, placeholder: "mlx-community/Qwen3-4B-4bit")
+                }
+            }
+
+            Text("默认走阅粒 Yueli AI（freemodel）云端推理；也兼容任意 OpenAI 兼容 /chat/completions 服务与 /v1/completions 聚合网关，本地 Ollama、Apple Silicon MLX（mlx_lm.server）。")
+                .font(.caption2)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            // 操作行
+            HStack(spacing: 8) {
+                Button("测试连接") {
+                    testAIConnection()
+                }
+                .controlSize(.small)
+                .disabled(isTestingAI || model.isAutoTagging)
+
+                if model.isAutoTagging {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text(model.aiTagProgressText)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    Button("停止", action: { model.stopAutoTag() })
+                        .controlSize(.small)
+                } else {
+                    Button("为未打标签的记录打标签") {
+                        model.startAutoTagUntaggedTrees()
+                        if model.isAutoTagging { model.showSettings() }
+                    }
+                    .controlSize(.small)
+                }
+
+                Spacer(minLength: 0)
+            }
+
+            if let result = aiTestResult {
+                Text(result)
+                    .font(.caption)
+                    .foregroundColor(result.contains("失败") ? .red : .secondary)
+                    .lineLimit(2)
+                    .truncationMode(.tail)
+            }
+        }
+    }
+
+    private func configRow(title: String, text: Binding<String>, placeholder: String, secure: Bool = false) -> some View {
+        HStack(spacing: 10) {
+            Text(title)
+                .font(.system(size: 12))
+                .foregroundColor(.secondary)
+                .frame(width: 52, alignment: .leading)
+            if secure {
+                SecureField(placeholder, text: text)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 12))
+            } else {
+                TextField(placeholder, text: text)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 12))
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(Color.secondary.opacity(0.08)))
+    }
+
+    private func testAIConnection() {
+        isTestingAI = true
+        aiTestResult = nil
+        let (_, endpoint) = AppModel.currentAIConfig()
+        Task {
+            do {
+                let reply = try await TagAIService.ping(config: endpoint)
+                aiTestResult = "连接正常：\(reply.prefix(40))"
+            } catch {
+                aiTestResult = "连接失败：\(error.localizedDescription)"
+            }
+            isTestingAI = false
         }
     }
 

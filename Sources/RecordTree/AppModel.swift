@@ -32,6 +32,8 @@ struct TreeRowVM: Identifiable {
     let fullText: String
     let caption: String
     let chunks: [ChunkRowVM]
+    /// 树级标签 + 分段标签（分段标签原样并入展示）
+    var tags: [String] = []
 
     init(tree: TreeRec) {
         self.tree = tree
@@ -106,6 +108,9 @@ enum AppViewMode: Equatable {
     case newRecord
     case searchResults
     case settings
+    case clipboardHistory
+    case tagCloud
+    case tagResults
 }
 
 // MARK: - 应用状态
@@ -136,7 +141,19 @@ final class AppModel: ObservableObject {
 
     @Published var viewMode: AppViewMode = .list
     @Published var previousViewMode: AppViewMode? = nil
+    /// 任一自定义弹层 / 模式激活（删除确认、丢弃草稿、日期跳转、多选）。
+    /// AppDelegate 的 ESC 监听据此放行按键，避免弹层期按 ESC 把整个面板藏掉。
+    @Published var overlayActive = false
     @Published var searchResults: [SearchResultVM] = []
+
+    // MARK: - 剪切板历史
+    @Published var clipboardHistoryItems: [ClipboardHistoryItem] = []
+    @Published var clipboardHistoryCursor = 0
+    @Published var clipboardHistoryTotal = 0
+    private let clipboardHistoryPageSize = 50
+    var clipboardHistoryHasMore: Bool {
+        clipboardHistoryCursor + clipboardHistoryItems.count < clipboardHistoryTotal
+    }
 
     /// 底部日期跳转目录（最新在上，每项一个“有记录的日子”）
     @Published var dayJumpItems: [DayJumpItem] = []
@@ -264,10 +281,23 @@ final class AppModel: ObservableObject {
     }
 
     func boot() throws {
+        migrateAICloudDefaultsIfNeeded()
         // 若用户曾选择自定义数据目录（iCloud Drive / 同步盘），先恢复
         AppPaths.restoreConfiguredRoot()
         store = try DataStore()
         reload()
+    }
+
+    /// AI 云端默认迁移：旧默认（OpenAI / gpt-4o-mini）→ 阅粒 Yueli AI（freemodel）。
+    /// 仅当存储值仍等于旧默认（即用户从未定制）时替换；自定义值不动。
+    private func migrateAICloudDefaultsIfNeeded() {
+        let d = UserDefaults.standard
+        if d.string(forKey: "ai.cloud.base") == "https://api.openai.com/v1" {
+            d.set("https://yueli.com/api/yueliai/v1/completions", forKey: "ai.cloud.base")
+        }
+        if d.string(forKey: "ai.cloud.model") == "gpt-4o-mini" {
+            d.set("freemodel", forKey: "ai.cloud.model")
+        }
     }
 
     // MARK: - 存储与 iCloud 同步
@@ -409,7 +439,7 @@ final class AppModel: ObservableObject {
     // MARK: - 剪贴板事件
 
     func handleExternalCopy(content: String, source: String) {
-        guard let store, !content.isEmpty else { return }
+        guard autoRecordClipboard, let store, !content.isEmpty else { return }
         do {
             let at = TimeUtil.msNow()
             let info = try store.performExternalCopy(content: content, source: source, atMs: at)
@@ -421,6 +451,10 @@ final class AppModel: ObservableObject {
             }
             archive(info: info, kind: "复制自外部", content: content, source: source, atMs: at)
             reload()
+            if viewMode == .clipboardHistory {
+                clipboardHistoryCursor = 0
+                loadClipboardHistory()
+            }
         } catch {
             NSLog("handleExternalCopy error: \(error)")
         }
@@ -463,7 +497,7 @@ final class AppModel: ObservableObject {
 
     /// 外部图片复制：转 PNG 保存到数据目录，并生成展示文字记录
     func handleExternalImageCopy(rawImage: Data, source: String) {
-        guard let store, let img = ClipboardImage.decodePNG(rawImage) else { return }
+        guard autoRecordClipboard, let store, let img = ClipboardImage.decodePNG(rawImage) else { return }
         do {
             let at = TimeUtil.msNow()
             let rel = try ClipboardImage.savePNG(
@@ -475,6 +509,10 @@ final class AppModel: ObservableObject {
             let info = try store.performExternalImageCopy(content: text, attachment: rel, source: source, atMs: at)
             archive(info: info, kind: "复制图片（外部）", content: text, source: source, atMs: at)
             reload()
+            if viewMode == .clipboardHistory {
+                clipboardHistoryCursor = 0
+                loadClipboardHistory()
+            }
         } catch {
             NSLog("handleExternalImageCopy error: \(error)")
         }
@@ -526,6 +564,76 @@ final class AppModel: ObservableObject {
         previousViewMode = nil
     }
 
+    // MARK: - 剪切板历史
+
+    func showClipboardHistory() {
+        if viewMode != .clipboardHistory {
+            previousViewMode = viewMode
+        }
+        viewMode = .clipboardHistory
+        clipboardHistoryCursor = 0
+        loadClipboardHistory()
+    }
+
+    func exitClipboardHistory() {
+        viewMode = previousViewMode ?? .list
+        previousViewMode = nil
+    }
+
+    func loadClipboardHistory() {
+        guard let store else { return }
+        do {
+            clipboardHistoryTotal = try store.clipboardHistoryCount()
+            let items = try store.fetchClipboardHistory(
+                limit: clipboardHistoryPageSize,
+                offset: clipboardHistoryCursor
+            )
+            if clipboardHistoryCursor == 0 {
+                clipboardHistoryItems = items
+            } else {
+                clipboardHistoryItems.append(contentsOf: items)
+            }
+        } catch {
+            NSLog("loadClipboardHistory error: \(error)")
+        }
+    }
+
+    func loadMoreClipboardHistory() {
+        guard clipboardHistoryHasMore else { return }
+        clipboardHistoryCursor += clipboardHistoryPageSize
+        loadClipboardHistory()
+    }
+
+    /// 复制剪切板历史中的某条记录
+    func copyClipboardItem(_ item: ClipboardHistoryItem) {
+        if item.isImage {
+            // 图片：尝试回写原图
+            if let url = AppPaths.attachmentURL(relativePath: item.attachment),
+               let png = try? Data(contentsOf: url) {
+                let pbItem = NSPasteboardItem()
+                guard pbItem.setData(png, forType: .png) else {
+                    showToast("复制失败")
+                    return
+                }
+                if let img = NSImage(data: png), let tiff = img.tiffRepresentation {
+                    pbItem.setData(tiff, forType: .tiff)
+                }
+                pbItem.setString(item.id, forType: ClipboardImage.selfCopyMarkerType)
+                let pb = NSPasteboard.general
+                pb.clearContents()
+                guard pb.writeObjects([pbItem]) else {
+                    showToast("复制失败")
+                    return
+                }
+                showToast("已复制图片")
+            } else {
+                writeAndFlag(content: item.content, chunkID: item.id, feedback: "已复制")
+            }
+        } else {
+            writeAndFlag(content: item.content, chunkID: item.id, feedback: "已复制")
+        }
+    }
+
     /// 一键清空全部记录（需先在 UI 层确认，删除即不可恢复）
     func clearAllRecords() {
         guard let store else { return }
@@ -550,6 +658,39 @@ final class AppModel: ObservableObject {
             showToast("已清空全部记录")
         } catch {
             NSLog("clearAllRecords error: \(error)")
+            showToast("清空失败")
+        }
+    }
+
+    /// 一键清空剪切板历史（UI 层需先确认）：只删 clipboard 类型树，
+    /// 手工笔记（note）不受影响；受影响天的 Markdown 归档同步重写
+    func clearClipboardHistory() {
+        guard let store else { return }
+        do {
+            let at = TimeUtil.msNow()
+            let summary = try store.deleteAllClipboardHistory()
+            guard !summary.treeIDs.isEmpty else {
+                showToast("剪切板历史已是空的")
+                return
+            }
+            let block = DataStore.eventBlock(
+                kind: "一键清空剪切板历史（\(summary.treeIDs.count) 条，含 \(summary.chunkCount) 个分段）",
+                content: "清空剪切板历史：\n" + summary.treeIDs.joined(separator: "\n"),
+                source: AppInfo.zhName,
+                treeID: "",
+                chunkID: nil,
+                atMs: at
+            )
+            try? store.writeEventLog(atMs: at, block: block)
+            for day in summary.dayKeys {
+                try? store.rewriteDailyMarkdown(dayKey: day)
+            }
+            clipboardHistoryCursor = 0
+            loadClipboardHistory()
+            reload()
+            showToast("已清空剪切板历史（\(summary.treeIDs.count) 条）")
+        } catch {
+            NSLog("clearClipboardHistory error: \(error)")
             showToast("清空失败")
         }
     }
@@ -583,10 +724,117 @@ final class AppModel: ObservableObject {
             reload()
             revealTree(info.treeID, expand: false)
             viewMode = .list
-            showToast("已新建记录")
+            showToast("已新建笔记")
             return true
         } catch {
             NSLog("createNewRecord error: \(error)")
+            return false
+        }
+    }
+
+    /// 读取当前剪切板文本（去除首尾空白），用于一键粘贴为笔记 / 分段
+    func clipboardText() -> String? {
+        guard let s = NSPasteboard.general.string(forType: .string) else { return nil }
+        let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        return t.isEmpty ? nil : t
+    }
+
+    /// 一键将剪切板文本保存为新笔记（无需打开编辑器）
+    @discardableResult
+    func createNoteFromClipboard() -> Bool {
+        guard let text = clipboardText(), let store else {
+            showToast("剪切板中没有可粘贴的文本")
+            return false
+        }
+        do {
+            let at = TimeUtil.msNow()
+            let info = try store.performManualNewRecord(title: "", content: text, atMs: at)
+            archive(info: info, kind: "从剪切板粘贴为笔记", content: text, source: "剪切板", atMs: at)
+            reload()
+            revealTree(info.treeID, expand: false)
+            showToast("已从剪切板创建笔记")
+            return true
+        } catch {
+            NSLog("createNoteFromClipboard error: \(error)")
+            return false
+        }
+    }
+
+    /// 剪切板历史条目 → 归档为笔记：新建 kind='note' 记录（内容/附件/来源取自该条目），
+    /// 原历史条目保留不动。归档后主列表可见。
+    @discardableResult
+    func archiveClipboardItemAsNote(_ item: ClipboardHistoryItem) -> Bool {
+        guard let store else { return false }
+        do {
+            let at = TimeUtil.msNow()
+            let info = try store.performManualNewRecord(
+                title: "",
+                content: item.content,
+                atMs: at,
+                attachment: item.isImage ? item.attachment : "",
+                sourceApp: item.sourceApp
+            )
+            archive(
+                info: info,
+                kind: "剪切板历史归档为笔记",
+                content: item.content,
+                source: item.sourceApp.isEmpty ? "剪切板历史" : item.sourceApp,
+                atMs: at
+            )
+            reload()
+            revealTree(info.treeID, expand: false)
+            showToast("已归档为笔记")
+            return true
+        } catch {
+            NSLog("archiveClipboardItemAsNote error: \(error)")
+            showToast("归档失败")
+            return false
+        }
+    }
+
+    /// 一键将剪切板文本追加到指定笔记树（无需打开行内编辑器）
+    @discardableResult
+    func appendClipboardToTree(_ treeID: String) -> Bool {
+        guard let text = clipboardText(), let store else {
+            showToast("剪切板中没有可粘贴的文本")
+            return false
+        }
+        do {
+            let at = TimeUtil.msNow()
+            guard let info = try store.performManualAppend(treeID: treeID, content: text, atMs: at) else {
+                showToast("目标记录不存在")
+                return false
+            }
+            archive(info: info, kind: "从剪切板追加分段", content: text, source: "剪切板", atMs: at)
+            reload()
+            revealTree(treeID, expand: true)
+            showToast("已追加剪切板内容")
+            return true
+        } catch {
+            NSLog("appendClipboardToTree error: \(error)")
+            return false
+        }
+    }
+
+    /// 更新笔记：修改标题与首个分段内容（树状笔记的其它分段通过追加/删除管理）
+    @discardableResult
+    func updateRecord(treeID: String, title: String, content: String) -> Bool {
+        guard let content = cleaned(content), let store else { return false }
+        do {
+            let at = TimeUtil.msNow()
+            try store.updateTitle(treeID: treeID, title: title)
+            // 找到首个分段（按创建时间正序的第一个）并更新内容
+            let chunks = try store.chunks(ofTree: treeID).sorted { $0.createdAtMs < $1.createdAtMs }
+            if let first = chunks.first {
+                try store.updateChunkContent(chunkID: first.id, content: content, atMs: at)
+                try store.touchTree(treeID: treeID, atMs: at)
+            }
+            reload()
+            revealTree(treeID, expand: false)
+            showToast("已更新笔记")
+            return true
+        } catch {
+            NSLog("updateRecord error: \(error)")
             return false
         }
     }
@@ -607,8 +855,10 @@ final class AppModel: ObservableObject {
 
     // MARK: - 追加 chunk
 
+    /// 追加分段。keepAdding=true 用于"连续追加"场景：保存后不清滚动定位，
+    /// 让行内编辑器保持在原位继续输入，避免每次保存都把树滚到顶部打断节奏。
     @discardableResult
-    func manualAppendToTree(_ treeID: String, content: String) -> Bool {
+    func manualAppendToTree(_ treeID: String, content: String, keepAdding: Bool = false) -> Bool {
         guard let store, let content = cleaned(content) else { return false }
         do {
             let at = TimeUtil.msNow()
@@ -618,8 +868,13 @@ final class AppModel: ObservableObject {
             }
             archive(info: info, kind: "手工追加分段", content: content, source: "手动输入", atMs: at)
             reload()
-            revealTree(treeID, expand: true)
-            showToast("已追加分段")
+            if keepAdding {
+                scrollTargetTreeID = nil
+                showToast("已追加分段，⌘⏎ 继续 · ESC 结束")
+            } else {
+                revealTree(treeID, expand: true)
+                showToast("已追加分段")
+            }
             return true
         } catch {
             NSLog("manualAppendToTree error: \(error)")
@@ -912,7 +1167,7 @@ final class AppModel: ObservableObject {
             return
         }
         do {
-            let metas = try store.allTreeMetas()
+            let metas = try store.allNoteTreeMetas()
             latestMetas = metas
             var buckets: [DayBucket] = []
             for m in metas {
@@ -993,7 +1248,7 @@ final class AppModel: ObservableObject {
         }
         let u = units[cursor]
         guard
-            let trees = try? store.fetchTrees(
+            let trees = try? store.fetchNoteTrees(
                 startMs: u.dayStartMs,
                 endMs: u.dayEndMs,
                 limit: u.count,
@@ -1004,6 +1259,14 @@ final class AppModel: ObservableObject {
             return
         }
         rows = trees.map { TreeRowVM(tree: $0) }
+        // 标签批量注入（树级 + 分段级合并展示）
+        if let tagMap = try? store.tagsForTrees(trees.map { $0.id }) {
+            rows = rows.map { row in
+                var r = row
+                r.tags = tagMap[row.id] ?? []
+                return r
+            }
+        }
         currentDayKey = u.dayKey
         dayTitle = TimeUtil.titleDate(ms: u.dayStartMs)
         dayMetaText = u.pagesInDay > 1
@@ -1042,6 +1305,233 @@ final class AppModel: ObservableObject {
         }
     }
 
+    // MARK: - 标签
+
+    @Published var tagCloudItems: [DataStore.TagCloudEntry] = []
+    @Published var tagResults: [TreeRowVM] = []
+    @Published var selectedTagName = ""
+
+    /// AI 打标签
+    @Published var isAutoTagging = false
+    @Published var aiTagProgressText = ""
+
+    private var aiTagTask: Task<Void, Never>?
+
+    enum AIConfigKey {
+        static let provider = "ai.provider"
+        static let cloudBase = "ai.cloud.base"
+        static let cloudKey = "ai.cloud.key"
+        static let cloudModel = "ai.cloud.model"
+        static let ollamaBase = "ai.ollama.base"
+        static let ollamaModel = "ai.ollama.model"
+        static let mlxBase = "ai.mlx.base"
+        static let mlxModel = "ai.mlx.model"
+    }
+
+    /// 读取当前生效的 AI 端点配置（按设置页选中的预设）
+    static func currentAIConfig() -> (preset: AIProviderPreset, config: AIEndpointConfig) {
+        let d = UserDefaults.standard
+        let preset = AIProviderPreset(rawValue: d.integer(forKey: AIConfigKey.provider)) ?? .cloud
+        var base: String
+        let key: String
+        var model: String
+        switch preset {
+        case .cloud:
+            base = d.string(forKey: AIConfigKey.cloudBase) ?? preset.defaultBaseURL
+            key = d.string(forKey: AIConfigKey.cloudKey) ?? ""
+            model = d.string(forKey: AIConfigKey.cloudModel) ?? preset.defaultModel
+            // 迁移：旧版默认（OpenAI / gpt-4o-mini）视为未定制，切换到 Yueli AI freemodel 新默认
+            if base == "https://api.openai.com/v1" { base = preset.defaultBaseURL }
+            if model == "gpt-4o-mini" { model = preset.defaultModel }
+        case .ollama:
+            base = d.string(forKey: AIConfigKey.ollamaBase) ?? preset.defaultBaseURL
+            key = ""
+            model = d.string(forKey: AIConfigKey.ollamaModel) ?? preset.defaultModel
+        case .mlx:
+            base = d.string(forKey: AIConfigKey.mlxBase) ?? preset.defaultBaseURL
+            key = ""
+            model = d.string(forKey: AIConfigKey.mlxModel) ?? preset.defaultModel
+        }
+        return (
+            preset,
+            AIEndpointConfig(
+                baseURL: base.isEmpty ? preset.defaultBaseURL : base,
+                apiKey: key,
+                model: model.isEmpty ? preset.defaultModel : model
+            )
+        )
+    }
+
+    func showTagCloud() {
+        refreshTagCloud()
+        viewMode = .tagCloud
+    }
+
+    func refreshTagCloud() {
+        tagCloudItems = (try? store?.tagCloud()) ?? []
+    }
+
+    func openTag(_ name: String) {
+        selectedTagName = name
+        tagResults = loadTagResultRows(name)
+        viewMode = .tagResults
+    }
+
+    func backToTagCloud() {
+        refreshTagCloud()
+        viewMode = .tagCloud
+    }
+
+    private func loadTagResultRows(_ name: String) -> [TreeRowVM] {
+        guard let store,
+              let trees = try? store.treesByTag(name) else { return [] }
+        var rows = trees.map { TreeRowVM(tree: $0) }
+        if let tagMap = try? store.tagsForTrees(trees.map { $0.id }) {
+            rows = rows.map { row in
+                var r = row
+                r.tags = tagMap[row.id] ?? []
+                return r
+            }
+        }
+        return rows
+    }
+
+    /// 供标签编辑弹层回填当前值
+    func treeTagNames(_ treeID: String) -> [String] {
+        (try? store?.tagsForItem(itemType: "tree", itemID: treeID)) ?? []
+    }
+
+    func chunkTagNames(_ chunkID: String) -> [String] {
+        (try? store?.tagsForItem(itemType: "chunk", itemID: chunkID)) ?? []
+    }
+
+    /// 从标签结果页定位到主列表
+    func openTreeFromTagResult(_ treeID: String) {
+        viewMode = .list
+        reload()
+        revealTree(treeID, expand: false)
+    }
+
+    /// 手工设置树级标签
+    func setTreeTags(_ treeID: String, names: [String]) {
+        guard let store else { return }
+        do {
+            try store.setTags(itemType: "tree", itemID: treeID, names: names)
+            reload()
+            refreshTagCloud()
+            showToast(names.isEmpty ? "已清除标签" : "已设置 \(names.count) 个标签")
+        } catch {
+            NSLog("setTreeTags error: \(error)")
+            showToast("标签保存失败")
+        }
+    }
+
+    /// 手工设置分段级标签
+    func setChunkTags(_ chunkID: String, names: [String]) {
+        guard let store else { return }
+        do {
+            try store.setTags(itemType: "chunk", itemID: chunkID, names: names)
+            reload()
+            refreshTagCloud()
+            showToast(names.isEmpty ? "已清除标签" : "已设置 \(names.count) 个标签")
+        } catch {
+            NSLog("setChunkTags error: \(error)")
+            showToast("标签保存失败")
+        }
+    }
+
+    /// 对单棵树执行 AI 打标签（追加式：与现有标签合并）
+    func aiTagTree(_ treeID: String) {
+        guard !isAutoTagging else {
+            showToast("批量打标签进行中，请稍候")
+            return
+        }
+        guard let store else { return }
+        let (_, endpoint) = Self.currentAIConfig()
+        // DB 访问全部在主线程完成后，Task 内只做网络调用
+        guard let merged = try? store.mergedContentForTree(treeID: treeID) else {
+            showToast("记录不存在")
+            return
+        }
+        let existing = treeTagNames(treeID)
+        isAutoTagging = true
+        aiTagProgressText = "AI 分析中…"
+        aiTagTask = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                DispatchQueue.main.async { self.isAutoTagging = false }
+            }
+            do {
+                let raw = try await TagAIService.chat(config: endpoint, userContent: merged)
+                let tags = TagAIService.parseTags(raw)
+                guard !tags.isEmpty else {
+                    DispatchQueue.main.async { self.showToast("AI 未返回有效标签") }
+                    return
+                }
+                await MainActor.run {
+                    self.setTreeTags(treeID, names: tags + existing)
+                }
+            } catch {
+                NSLog("aiTagTree error: \(error)")
+                DispatchQueue.main.async { self.showToast("AI 打标签失败：\(error.localizedDescription)") }
+            }
+        }
+    }
+
+    /// 批量：为所有未打标签的记录 AI 打标签
+    func startAutoTagUntaggedTrees() {
+        guard !isAutoTagging else { return }
+        guard let store else { return }
+        guard let items = try? store.untaggedTreeContents(limit: 300), !items.isEmpty else {
+            showToast("所有记录都已有标签")
+            return
+        }
+        let (_, endpoint) = Self.currentAIConfig()
+        isAutoTagging = true
+        let total = items.count
+        aiTagProgressText = "0 / \(total)"
+        var okCount = 0
+        var failCount = 0
+        aiTagTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            for item in items {
+                if Task.isCancelled { break }
+                do {
+                    let raw = try await TagAIService.chat(config: endpoint, userContent: item.merged)
+                    let tags = TagAIService.parseTags(raw)
+                    if !tags.isEmpty {
+                        try? store.setTags(itemType: "tree", itemID: item.treeID, names: tags)
+                        okCount += 1
+                    } else {
+                        failCount += 1
+                    }
+                } catch {
+                    failCount += 1
+                    NSLog("autoTag error: \(error)")
+                    self.aiTagProgressText = "出错：\(error.localizedDescription)"
+                    // 连续失败过多视为端点不可用，中止
+                    if failCount >= 3 && okCount == 0 { break }
+                }
+                let done = okCount + failCount
+                self.aiTagProgressText = "\(done) / \(total) · 最新：\(item.title.isEmpty ? String(item.merged.prefix(16)) : item.title)"
+            }
+            self.isAutoTagging = false
+            self.reload()
+            self.refreshTagCloud()
+            if Task.isCancelled {
+                self.showToast("已停止（完成 \(okCount) 条）")
+            } else if okCount == 0 && failCount > 0 {
+                self.showToast("AI 打标签失败，请检查设置")
+            } else {
+                self.showToast("已为 \(okCount) 条记录打标签")
+            }
+        }
+    }
+
+    func stopAutoTag() {
+        aiTagTask?.cancel()
+    }
+
     // MARK: - 杂项
 
     private func cleaned(_ text: String) -> String? {
@@ -1049,7 +1539,7 @@ final class AppModel: ObservableObject {
         return t.isEmpty ? nil : t
     }
 
-    private func showToast(_ text: String) {
+    func showToast(_ text: String) {
         lastToast = text
         toastWork?.cancel()
         let w = DispatchWorkItem { [weak self] in
