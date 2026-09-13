@@ -80,16 +80,8 @@ struct ContentView: View {
     @State private var hoveredTreeID: String?
     @State private var hoveredChunkID: String?
 
-    // 新建 maintree 编辑器
-    @State private var newTitle = ""
-    @State private var newContent = ""
-
     // 编辑已有笔记
     @State private var editingTreeID: String?
-    @State private var editTitle = ""
-    @State private var editContent = ""
-    @FocusState private var editTitleFocused: Bool
-    @FocusState private var editContentFocused: Bool
 
     // 搜索
     @State private var searchText = ""
@@ -98,9 +90,9 @@ struct ContentView: View {
     @State private var searchWork: DispatchWorkItem?
     /// 进入搜索界面后自动聚焦输入框，方便直接输入
     @FocusState private var searchFieldFocused: Bool
-    /// 新建 maintree 编辑区的焦点（自动聚焦标题，回车跳到正文）
-    @FocusState private var newTitleFocused: Bool
-    @FocusState private var newContentFocused: Bool
+
+    /// 新建笔记编辑器内部是否存在未保存草稿，由 `RecordEditor` 回调更新
+    @State private var newDraftPresent = false
 
     // 在当前 maintree 后追加 chunk 的草稿
     @State private var chunkDraftTreeID: String?
@@ -154,10 +146,46 @@ struct ContentView: View {
             ZStack {
                 listArea
                 if model.viewMode == .newRecord {
-                    newRecordEditor
+                    RecordEditor(
+                        mode: .new,
+                        model: model,
+                        onSave: { title, content in
+                            let ok = model.createNewRecord(title: title, content: content)
+                            // 编辑器保存成功后会被移除，onChange 不再触发，这里显式复位草稿标记，
+                            // 否则下次新建点「取消」会误弹“丢弃草稿”确认
+                            if ok { newDraftPresent = false }
+                            return ok
+                        },
+                        onCancel: {
+                            if newDraftPresent {
+                                discardNewDraft = true
+                            } else {
+                                model.cancelNewRecord()
+                            }
+                        },
+                        onDraftChanged: { newDraftPresent = $0 }
+                    )
+                    .id("new-record")
                 }
-                if editingTreeID != nil {
-                    editRecordEditor
+                if let tid = editingTreeID,
+                   let row = model.rows.first(where: { $0.id == tid }) {
+                    RecordEditor(
+                        mode: .edit,
+                        model: model,
+                        initialTitle: row.tree.title,
+                        initialContent: row.tree.chunks
+                            .sorted { $0.createdAtMs < $1.createdAtMs }
+                            .first?.content ?? "",
+                        onSave: { title, content in
+                            let ok = model.updateRecord(treeID: tid, title: title, content: content)
+                            if ok { editingTreeID = nil }
+                            return ok
+                        },
+                        onCancel: {
+                            editingTreeID = nil
+                        }
+                    )
+                    .id(tid)
                 }
                 if model.viewMode == .searchResults {
                     searchResultsView
@@ -393,18 +421,11 @@ struct ContentView: View {
 
     // MARK: - 新建记录：丢弃草稿确认
 
-    /// 是否有未保存的草稿（标题或正文任一非空）
-    private var hasNewDraft: Bool {
-        !newTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            || !newContent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
-
     /// 取消/ESC 离开编辑器：有草稿先确认，避免静默丢失输入
     private func cancelNewRecordEditing() {
-        if hasNewDraft {
+        if newDraftPresent {
             discardNewDraft = true
         } else {
-            clearNewRecordDraft()
             model.cancelNewRecord()
         }
     }
@@ -417,7 +438,7 @@ struct ContentView: View {
                 onContinue: { discardNewDraft = false },
                 onDiscard: {
                     discardNewDraft = false
-                    clearNewRecordDraft()
+                    newDraftPresent = false
                     model.cancelNewRecord()
                 }
             )
@@ -1048,18 +1069,23 @@ struct ContentView: View {
                 )
             }
             .buttonStyle(.plain)
+            // 顶部操作行只作鼠标/快捷键入口：关闭键盘焦点，避免默认获得焦点时
+            // 画出系统蓝色焦点环（与标题栏图标按钮的处理保持一致）
+            .focusable(false)
             .keyboardShortcut("f", modifiers: .command)
             .help("打开搜索界面（⌘F）")
 
             Button(action: { model.showNewRecord() }) {
                 Label("新建笔记", systemImage: "doc.badge.plus")
             }
+            .focusable(false)
             .keyboardShortcut("n", modifiers: .command)
             .help("新建一条笔记（⌘N）")
 
             Button(action: { model.createNoteFromClipboard() }) {
                 Label("粘贴为笔记", systemImage: "clipboard.badge.plus")
             }
+            .focusable(false)
             .keyboardShortcut("v", modifiers: [.command, .shift])
             .help("将剪切板文本一键保存为新笔记（⌘⇧V）")
 
@@ -1067,6 +1093,7 @@ struct ContentView: View {
                 Label("多选", systemImage: "checkmark.circle")
             }
             .controlSize(.small)
+            .focusable(false)
             .help("进入多选：批量勾选记录后一并删除")
         }
         .padding(.horizontal, 12)
@@ -1670,200 +1697,15 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - 新建 maintree 编辑区
+    // MARK: - 笔记编辑
 
-    private func clearNewRecordDraft() {
-        newTitle = ""
-        newContent = ""
-        newTitleFocused = false
-        newContentFocused = false
-    }
-
-    /// 把剪切板文本追加到编辑器内容末尾（新建 / 编辑共用；区别于 ⌘V 的光标处粘贴）
-    private func appendClipboard(to target: inout String) {
-        if let text = model.clipboardText() {
-            target += (target.isEmpty ? "" : "\n") + text
-        }
-    }
-
-    private func saveNewRecord() {
-        if model.createNewRecord(title: newTitle, content: newContent) {
-            newTitle = ""
-            newContent = ""
-            newTitleFocused = false
-            newContentFocused = false
-        }
-    }
-
-    private func saveEditRecord() {
-        if let tid = editingTreeID,
-           model.updateRecord(treeID: tid, title: editTitle, content: editContent) {
-            cancelEditing()
-        }
-    }
-
-    /// 进入笔记编辑：预填标题与首个分段内容
+    /// 进入笔记编辑：记录当前树 ID，具体标题/内容由 `RecordEditor` 读取
     private func startEditingTree(_ treeID: String) {
-        guard let row = model.rows.first(where: { $0.id == treeID }) else { return }
         editingTreeID = treeID
-        editTitle = row.tree.title
-        let firstChunk = row.tree.chunks.sorted { $0.createdAtMs < $1.createdAtMs }.first
-        editContent = firstChunk?.content ?? ""
-        editTitleFocused = false
-        editContentFocused = false
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
-            editTitleFocused = true
-        }
     }
 
     private func cancelEditing() {
         editingTreeID = nil
-        editTitle = ""
-        editContent = ""
-    }
-
-    private var newRecordEditor: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Text("新建笔记")
-                    .font(.headline)
-                Spacer()
-                Button {
-                    appendClipboard(to: &newContent)
-                } label: {
-                    Label("追加剪切板", systemImage: "doc.on.clipboard")
-                }
-                .controlSize(.small)
-                .keyboardShortcut("v", modifiers: [.command, .shift])
-                .help("将剪切板文本追加到内容末尾（⌘⇧V）；⌘V 则粘贴到光标处")
-                Button("取消") {
-                    cancelNewRecordEditing()
-                }
-                .keyboardShortcut(.cancelAction)
-                .help("放弃草稿并返回（ESC）")
-            }
-            .padding(.horizontal, 12)
-            .padding(.top, 12)
-            .padding(.bottom, 8)
-
-            VStack(spacing: 10) {
-                TextField("标题（可选）", text: $newTitle)
-                    .textFieldStyle(.roundedBorder)
-                    .focused($newTitleFocused)
-                    .onSubmit { newContentFocused = true }
-
-                ZStack(alignment: .topLeading) {
-                    TextEditor(text: $newContent)
-                        .font(.system(size: 13))
-                        .frame(minHeight: 180)
-                        .focused($newContentFocused)
-                    if newContent.isEmpty {
-                        Text("在此输入记录内容…")
-                            .font(.system(size: 13))
-                            .foregroundColor(.secondary)
-                            .padding(.top, 6)
-                            .padding(.leading, 4)
-                            .allowsHitTesting(false)
-                    }
-                }
-            }
-            .padding(.horizontal, 12)
-
-            HStack {
-                Spacer()
-                Button("保存") {
-                    if model.createNewRecord(title: newTitle, content: newContent) {
-                        newTitle = ""
-                        newContent = ""
-                        newTitleFocused = false
-                        newContentFocused = false
-                    }
-                }
-                .keyboardShortcut(.defaultAction)
-                .disabled(newContent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            }
-            .padding(.horizontal, 12)
-            .padding(.bottom, 12)
-            .padding(.top, 8)
-
-            Spacer()
-        }
-        .background(Color(nsColor: .windowBackgroundColor))
-        .onAppear {
-            // 面板为非激活型，延迟一拍让 window/keyWindow 就绪后再聚焦
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
-                newTitleFocused = true
-            }
-        }
-    }
-
-    // MARK: - 编辑已有笔记
-
-    private var editRecordEditor: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Text("编辑笔记")
-                    .font(.headline)
-                Spacer()
-                Button {
-                    appendClipboard(to: &editContent)
-                } label: {
-                    Label("追加剪切板", systemImage: "doc.on.clipboard")
-                }
-                .controlSize(.small)
-                .keyboardShortcut("v", modifiers: [.command, .shift])
-                .help("将剪切板文本追加到内容末尾（⌘⇧V）；⌘V 则粘贴到光标处")
-                Button("取消") {
-                    cancelEditing()
-                }
-                .keyboardShortcut(.cancelAction)
-                .help("放弃修改并返回（ESC）")
-            }
-            .padding(.horizontal, 12)
-            .padding(.top, 12)
-            .padding(.bottom, 8)
-
-            VStack(spacing: 10) {
-                TextField("标题（可选）", text: $editTitle)
-                    .textFieldStyle(.roundedBorder)
-                    .focused($editTitleFocused)
-                    .onSubmit { editContentFocused = true }
-
-                ZStack(alignment: .topLeading) {
-                    TextEditor(text: $editContent)
-                        .font(.system(size: 13))
-                        .frame(minHeight: 180)
-                        .focused($editContentFocused)
-                    if editContent.isEmpty {
-                        Text("在此输入笔记内容…")
-                            .font(.system(size: 13))
-                            .foregroundColor(.secondary)
-                            .padding(.top, 6)
-                            .padding(.leading, 4)
-                            .allowsHitTesting(false)
-                    }
-                }
-            }
-            .padding(.horizontal, 12)
-
-            HStack {
-                Spacer()
-                Button("保存") {
-                    if let tid = editingTreeID,
-                       model.updateRecord(treeID: tid, title: editTitle, content: editContent) {
-                        cancelEditing()
-                    }
-                }
-                .keyboardShortcut(.defaultAction)
-                .disabled(editContent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            }
-            .padding(.horizontal, 12)
-            .padding(.bottom, 12)
-            .padding(.top, 8)
-
-            Spacer()
-        }
-        .background(Color(nsColor: .windowBackgroundColor))
     }
 
     // MARK: - 搜索区

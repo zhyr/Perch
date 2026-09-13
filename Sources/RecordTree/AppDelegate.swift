@@ -35,6 +35,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        setupMainMenu()
         activityToken = ProcessInfo.processInfo.beginActivity(
             options: [.userInitiatedAllowingIdleSystemSleep],
             reason: "\(AppInfo.zhName) 需要及时监听剪贴板变化"
@@ -59,6 +60,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupPanel()
         setupGlobalShortcut()
         setupEscapeToHide()
+        setupEditShortcutsFallback()
         installScrollSuppression()
         monitor.start()
         syncWatcher.start()
@@ -85,7 +87,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         AppModel.shared.shortcutAction = { [weak self] in
             self?.togglePanel()
         }
-        AppModel.shared.applyShortcut()
+        let ok = AppModel.shared.applyShortcut()
+        if !ok {
+            // 启动时注册失败需要日志 + Toast，避免用户设置的快捷键被系统/其它应用占用后还浑然不觉
+            NSLog("全局快捷键注册失败（已被系统或其它应用占用）")
+            AppModel.shared.showToast("全局快捷键已被占用，请前往设置更换组合键")
+        }
     }
 
     /// 面板激活状态下按 ESC 隐藏面板
@@ -100,6 +107,67 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // Esc 交给弹层“取消”按钮或多选退出逻辑，而不是隐藏整个面板
             if AppModel.shared.overlayActive { return event }
             self.hidePanel()
+            return nil
+        }
+    }
+
+    /// 为 LSUIElement 应用配置一个不可见的主菜单（含 Edit 菜单）。
+    ///
+    /// 浮动面板里的 SwiftUI TextField / TextEditor 在某些 macOS 版本下无法直接收到
+    /// 标准编辑快捷键（⌘V / ⌘C / ⌘X / ⌘A 等），因为没有可路由的 Edit 菜单。
+    /// 设置 mainMenu 后，系统会把这些键位等价路由到第一响应者，右击菜单能粘贴时
+    /// 键盘快捷键也应能粘贴。
+    private func setupMainMenu() {
+        let mainMenu = NSMenu(title: "MainMenu")
+
+        let appMenuItem = NSMenuItem()
+        let appMenu = NSMenu(title: AppInfo.zhName)
+        let quitItem = NSMenuItem(
+            title: "退出 \(AppInfo.zhName)",
+            action: #selector(NSApplication.terminate(_:)),
+            keyEquivalent: "q"
+        )
+        quitItem.keyEquivalentModifierMask = .command
+        appMenu.addItem(quitItem)
+        appMenuItem.submenu = appMenu
+        mainMenu.addItem(appMenuItem)
+
+        let editMenuItem = NSMenuItem(title: "编辑", action: nil, keyEquivalent: "")
+        let editMenu = NSMenu(title: "编辑")
+        editMenu.addItem(NSMenuItem(title: "撤销", action: #selector(UndoManager.undo), keyEquivalent: "z"))
+        editMenu.addItem(NSMenuItem.separator())
+        editMenu.addItem(NSMenuItem(title: "剪切", action: #selector(NSText.cut(_:)), keyEquivalent: "x"))
+        editMenu.addItem(NSMenuItem(title: "复制", action: #selector(NSText.copy(_:)), keyEquivalent: "c"))
+        editMenu.addItem(NSMenuItem(title: "粘贴", action: #selector(NSText.paste(_:)), keyEquivalent: "v"))
+        editMenu.addItem(NSMenuItem(title: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a"))
+        editMenuItem.submenu = editMenu
+        mainMenu.addItem(editMenuItem)
+
+        NSApp.mainMenu = mainMenu
+    }
+
+    /// 标准 Edit 菜单在某些面板/LSUIElement 组合下仍不能正确下发；这里兜底：
+    /// 当面板为 keyWindow 且第一响应者是文本控件时，直接派发 ⌘V/C/X/A/Z。
+    private func setupEditShortcutsFallback() {
+        _ = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self, self.panel.isKeyWindow else { return event }
+
+            let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            guard flags == .command else { return event }
+            guard let char = event.charactersIgnoringModifiers?.lowercased().first else { return event }
+
+            let action: Selector
+            switch char {
+            case "v": action = #selector(NSText.paste(_:))
+            case "x": action = #selector(NSText.cut(_:))
+            case "c": action = #selector(NSText.copy(_:))
+            case "a": action = #selector(NSText.selectAll(_:))
+            case "z": action = #selector(UndoManager.undo)
+            default: return event
+            }
+
+            guard self.isEditingText() else { return event }
+            NSApp.sendAction(action, to: nil, from: self)
             return nil
         }
     }

@@ -14,8 +14,10 @@ struct SettingsView: View {
     // AI 打标签配置（键与 AppModel.AIConfigKey 保持一致）
     @AppStorage(AppModel.AIConfigKey.provider) private var aiProvider = 0
     @AppStorage(AppModel.AIConfigKey.cloudBase) private var cloudBase = AIProviderPreset.cloud.defaultBaseURL
-    @AppStorage(AppModel.AIConfigKey.cloudKey) private var cloudKey = ""
     @AppStorage(AppModel.AIConfigKey.cloudModel) private var cloudModel = AIProviderPreset.cloud.defaultModel
+    /// API Key 存 Keychain，不再用 @AppStorage，避免明文写进 UserDefaults
+    @State private var cloudKey = ""
+    @State private var cloudKeySaveTask: Task<Void, Never>?
     @AppStorage(AppModel.AIConfigKey.ollamaBase) private var ollamaBase = AIProviderPreset.ollama.defaultBaseURL
     @AppStorage(AppModel.AIConfigKey.ollamaModel) private var ollamaModel = AIProviderPreset.ollama.defaultModel
     @AppStorage(AppModel.AIConfigKey.mlxBase) private var mlxBase = AIProviderPreset.mlx.defaultBaseURL
@@ -44,6 +46,18 @@ struct SettingsView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(nsColor: .windowBackgroundColor))
+        .task { cloudKey = AppModel.cloudAPIKey() }
+        .onChange(of: cloudKey) { newValue in
+            // 400ms 防抖，避免每敲一个字符就写一次钥匙串
+            cloudKeySaveTask?.cancel()
+            cloudKeySaveTask = Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 400_000_000)
+                guard !Task.isCancelled else { return }
+                if !AppModel.setCloudAPIKey(newValue) {
+                    model.showToast("API Key 写入钥匙串失败，请检查钥匙串访问权限")
+                }
+            }
+        }
         .onChange(of: isRecording) { recording in
             if recording {
                 startRecording()
@@ -405,6 +419,9 @@ struct SettingsView: View {
     private func testAIConnection() {
         isTestingAI = true
         aiTestResult = nil
+        // 防抖可能还没落盘，先立即写入，避免测的是旧 Key
+        cloudKeySaveTask?.cancel()
+        AppModel.setCloudAPIKey(cloudKey)
         let (_, endpoint) = AppModel.currentAIConfig()
         Task {
             do {

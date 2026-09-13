@@ -54,9 +54,14 @@ else
   echo "!! 缺少 $ICON_SRC，跳过图标" >&2
 fi
 
+# 签名身份：默认 ad-hoc（"-"）。
+# 注意：ad-hoc 签名每次构建后 cdhash 都会变，Keychain 里保存的 API Key 条目的 ACL
+# 会不再信任新版本，需要重新输入一次。若换成固定的自签名证书
+# （如 SIGN_IDENTITY="Perch Dev" ./scripts/build_app.sh install），即可避免。
+SIGN_IDENTITY="${SIGN_IDENTITY:--}"
 if command -v codesign >/dev/null 2>&1; then
-  echo "==> ad-hoc codesign"
-  codesign --force --sign - "$DEST" >/dev/null 2>&1 || true
+  echo "==> codesign ($SIGN_IDENTITY)"
+  codesign --force --sign "$SIGN_IDENTITY" "$DEST" >/dev/null 2>&1 || true
 fi
 
 # 清理旧版 RecordTree.app / 栖痕.app，避免多个包并存

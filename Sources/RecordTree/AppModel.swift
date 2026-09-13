@@ -191,6 +191,8 @@ final class AppModel: ObservableObject {
             autoRecordClipboard = defaults.bool(forKey: "autoRecordClipboard")
         }
         launchAtLoginEnabled = Self.launchAtLoginStatus()
+        // 启动即触发迁移：把旧版明文 API Key 从 UserDefaults 搬进 Keychain
+        _ = Self.cloudAPIKey()
     }
 
     /// 更新“删除需二次确认”设置
@@ -1328,12 +1330,53 @@ final class AppModel: ObservableObject {
     enum AIConfigKey {
         static let provider = "ai.provider"
         static let cloudBase = "ai.cloud.base"
+        /// 旧版明文存放 API Key 的键：仅用于迁移读取与清理，不再写入
         static let cloudKey = "ai.cloud.key"
         static let cloudModel = "ai.cloud.model"
         static let ollamaBase = "ai.ollama.base"
         static let ollamaModel = "ai.ollama.model"
         static let mlxBase = "ai.mlx.base"
         static let mlxModel = "ai.mlx.model"
+    }
+
+    /// 敏感值（API Key）改存 Keychain，这里只保留 account 名
+    enum AISecretKey {
+        static let cloudAPIKey = "ai.cloud.key"
+    }
+
+    /// 读取云端 API Key：优先 Keychain；发现旧版明文（UserDefaults）时自动迁移过去。
+    static func cloudAPIKey() -> String {
+        if let stored = KeychainStore.string(for: AISecretKey.cloudAPIKey), !stored.isEmpty {
+            // 顺手清掉可能残留的旧明文
+            clearLegacyPlaintextCloudKey()
+            return stored
+        }
+
+        let legacy = (UserDefaults.standard.string(forKey: AIConfigKey.cloudKey) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !legacy.isEmpty else { return "" }
+
+        // 迁移失败（如钥匙串访问被拒）时保留旧值继续可用，下次启动再试
+        if KeychainStore.set(legacy, for: AISecretKey.cloudAPIKey) {
+            clearLegacyPlaintextCloudKey()
+        }
+        return legacy
+    }
+
+    /// 写入云端 API Key（空字符串即清除）。返回是否写入成功。
+    @discardableResult
+    static func setCloudAPIKey(_ key: String) -> Bool {
+        let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        let ok = KeychainStore.set(trimmed, for: AISecretKey.cloudAPIKey)
+        if ok { clearLegacyPlaintextCloudKey() }
+        return ok
+    }
+
+    /// 清掉历史遗留的明文键，避免它继续留在 UserDefaults plist / 备份里
+    private static func clearLegacyPlaintextCloudKey() {
+        let d = UserDefaults.standard
+        guard d.object(forKey: AIConfigKey.cloudKey) != nil else { return }
+        d.removeObject(forKey: AIConfigKey.cloudKey)
     }
 
     /// 读取当前生效的 AI 端点配置（按设置页选中的预设）
@@ -1346,7 +1389,7 @@ final class AppModel: ObservableObject {
         switch preset {
         case .cloud:
             base = d.string(forKey: AIConfigKey.cloudBase) ?? preset.defaultBaseURL
-            key = d.string(forKey: AIConfigKey.cloudKey) ?? ""
+            key = cloudAPIKey()
             model = d.string(forKey: AIConfigKey.cloudModel) ?? preset.defaultModel
             // 迁移：旧版默认（OpenAI / gpt-4o-mini）视为未定制，切换到 Yueli AI freemodel 新默认
             if base == "https://api.openai.com/v1" { base = preset.defaultBaseURL }
