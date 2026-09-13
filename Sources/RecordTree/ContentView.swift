@@ -1255,7 +1255,7 @@ struct ContentView: View {
                     } else {
                         let maxTotal = model.tagCloudItems.first?.total ?? 1
                         LazyVGrid(
-                            columns: [GridItem(.adaptive(minimum: 56, maximum: 260), spacing: 8)],
+                            columns: [GridItem(.adaptive(minimum: 40, maximum: 300), spacing: 8)],
                             alignment: .leading,
                             spacing: 8
                         ) {
@@ -1267,6 +1267,7 @@ struct ContentView: View {
                                         Text(entry.name)
                                             .font(.system(size: tagFontSize(total: entry.total, maxTotal: maxTotal)))
                                             .lineLimit(1)
+                                            .fixedSize(horizontal: true, vertical: false)
                                         Text("\(entry.total)")
                                             .font(.caption2)
                                             .foregroundColor(.secondary)
@@ -1278,6 +1279,7 @@ struct ContentView: View {
                                     )
                                 }
                                 .buttonStyle(.plain)
+                                .focusable(false)
                                 .help("记录 \(entry.treeCount) 条 · 分段 \(entry.chunkCount) 个，点击查看")
                             }
                         }

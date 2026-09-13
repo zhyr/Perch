@@ -320,7 +320,7 @@ struct SettingsView: View {
                     .font(.system(size: 12))
                     .foregroundColor(.secondary)
                     .frame(width: 16)
-                Text("服务类型")
+                Text("类型")
                     .font(.system(size: 13))
                 Spacer(minLength: 8)
                 Picker("", selection: $aiProvider) {
