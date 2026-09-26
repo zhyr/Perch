@@ -62,11 +62,15 @@ enum AIProviderPreset: Int {
 enum TagAIService {
 
     static let systemPrompt = """
-    你是笔记打标签助手。根据给定的笔记标题与内容，输出 2-5 个最能概括其主题、所属项目或任务类型的简短标签。
+    你是笔记分类打标助手。输入包含笔记的标题、内容和来源应用，从三个维度提取标签：
+    A 内容主题：这篇笔记在讲什么——提取核心实体、所属项目或主题，并向上归纳成类别词（如「官网文章」「采购合同」「SwiftUI」）；
+    B 来源场景：内容来自哪里或用什么工具产生（如「Cursor 编码」「Traework」「微信对话」「浏览器摘录」）；
+    C 目的意图：为什么记这条（如「踩坑记录」「方案调研」「学习笔记」「待办」）。
     规则：
-    1. 标签用简体中文，专有名词/项目代号可保留原文；
-    2. 每个标签不超过 12 个字，不带 # 号；
-    3. 只输出一个 JSON 字符串数组，例如 ["终端轨迹","数据采购"]，不要输出任何解释或其他内容。
+    1. 三个维度各 0-2 个标签，共输出 2-6 个，按 A、B、C 顺序排列；
+    2. 每个标签 2-5 个汉字；软件名等专有名词保留英文原文（如 Cursor、Traework），不要中英混杂；
+    3. 标签必须是可聚合的类别词，禁止「笔记」「记录」「其他」「内容」「工具」这类泛词；
+    4. 只输出一个 JSON 字符串数组，例如 ["官网文章","Cursor 编码","方案调研"]，不要输出任何解释。
     """
 
     /// 调用 chat completions（非流式），返回助手文本
@@ -188,11 +192,12 @@ enum TagAIService {
             name = name.trimmingCharacters(in: .whitespacesAndNewlines)
             while name.hasPrefix("#") { name.removeFirst() }
             name = name.trimmingCharacters(in: .whitespacesAndNewlines)
-            if name.isEmpty || name.count > 16 { continue }
+            // 单字/超长标签没有聚合价值；三维度打标最多保留 6 个
+            if name.count < 2 || name.count > 16 { continue }
             if seen.contains(name) { continue }
             seen.insert(name)
             out.append(name)
-            if out.count >= 5 { break }
+            if out.count >= 6 { break }
         }
         return out
     }

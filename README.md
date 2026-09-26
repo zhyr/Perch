@@ -94,9 +94,9 @@ Perch 的做法：
 `~/Documents/Perch`
 ：
 `recordtree.sqlite`
-（数据主源）+
+（数据主源）
 `images/`
-（图片附件）+
+（图片附件）
 `markdown/`
 （归档）
 - 设置 → 选择 iCloud Drive（或其它同步盘）文件夹即可迁移。目标为空 → 整体迁移；目标已有 Perch 数据（如其它设备的同步文件）→ 直接切换采用，本机旧目录保留
@@ -107,7 +107,7 @@ Perch 的做法：
 即自动同步：应用每 2 秒检测数据文件远端变化并热重载
 - 同步采用
 **整文件替换**
-（单文件 SQLite +
+（单文件 SQLite
 `journal_mode=DELETE`
 避免 WAL 旁文件损坏），
 **非字段级合并**

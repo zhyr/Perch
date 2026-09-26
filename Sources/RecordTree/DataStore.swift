@@ -68,6 +68,10 @@ final class DataStore {
             );
             CREATE INDEX IF NOT EXISTS idx_item_tag_item ON item_tag (item_type, item_id);
             CREATE INDEX IF NOT EXISTS idx_item_tag_tag ON item_tag (tag_id);
+            CREATE TABLE IF NOT EXISTS app_meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
             """
         )
         // 兼容旧库：加上 title / archived_at 列
@@ -83,11 +87,13 @@ final class DataStore {
         migrateTreeKindsIfNeeded()
     }
 
-    /// 首次引入 kind 字段时的历史数据分类迁移
+    /// 按数据库文件记录迁移，而不是 UserDefaults。
+    /// 切换数据目录（本机 / iCloud）时，每个库各自迁移一次；
+    /// 全局标记会让第二个库跳过分类，旧记录既不进笔记列表也不稳定出现在历史里。
     private func migrateTreeKindsIfNeeded() {
-        let key = "migratedTreeKinds"
-        guard !UserDefaults.standard.bool(forKey: key) else { return }
+        if metaValue("migratedTreeKinds") == "1" { return }
         do {
+            try run("UPDATE maintree SET kind = 'clipboard' WHERE kind IS NULL OR TRIM(kind) = ''")
             // 找出所有分段 source_app 均为"手动输入"的树，标记为 note
             try run(
                 """
@@ -103,10 +109,39 @@ final class DataStore {
                 )
                 """
             )
-            UserDefaults.standard.set(true, forKey: key)
+            try setMeta("migratedTreeKinds", "1")
         } catch {
             NSLog("migrateTreeKindsIfNeeded error: \(error)")
         }
+    }
+
+    private func metaValue(_ key: String) -> String? {
+        guard let rows = try? query("SELECT value FROM app_meta WHERE key = ?", [key]),
+              let row = rows.first
+        else { return nil }
+        let value = str(row, "value")
+        return value.isEmpty ? nil : value
+    }
+
+    private func setMeta(_ key: String, _ value: String) throws {
+        try run(
+            "INSERT INTO app_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [key, value]
+        )
+    }
+
+    /// 同步重载前确认文件已下载且是完整的 SQLite，避免把 iCloud 占位文件当成空库打开。
+    static func databaseFileIsReady(at url: URL) -> Bool {
+        let keys: Set<URLResourceKey> = [.fileSizeKey, .ubiquitousItemDownloadingStatusKey]
+        guard let vals = try? url.resourceValues(forKeys: keys) else { return false }
+        if let status = vals.ubiquitousItemDownloadingStatus, status != .current {
+            return false
+        }
+        if let size = vals.fileSize, size < 100 { return false }
+        guard let fh = try? FileHandle(forReadingFrom: url) else { return false }
+        defer { try? fh.close() }
+        guard let data = try? fh.read(upToCount: 16), !data.isEmpty else { return false }
+        return data.starts(with: Data("SQLite format 3".utf8))
     }
 
     /// 显式关闭数据库（切换存储目录、远端变更重载前调用，会先完成事务落盘）
@@ -267,11 +302,12 @@ final class DataStore {
     }
 
     /// 全部 maintree 元信息，按更新时间倒序（主列表用）。
-    /// 主列表必须展示全部记录（手工笔记 + 剪贴板采集）：
-    /// 曾按 kind='note' 过滤导致用户 216 条历史"消失"，已按 2026-09-12 决策恢复全量。
+    /// 主列表仅展示手工笔记（kind='note'：新建 / 粘贴 / 归档为笔记），
+    /// 剪贴板自动采集（kind='clipboard'）只出现在「剪贴板历史」页——
+    /// 按 2026-09-15 决策：自动采集噪音太大，不再混入笔记列表。
     func allNoteTreeMetas() throws -> [(id: String, createdAtMs: Int64, updatedAtMs: Int64)] {
         let rows = try query(
-            "SELECT id, created_at AS ca, updated_at AS ua FROM maintree ORDER BY updated_at DESC, created_at DESC, id"
+            "SELECT id, created_at AS ca, updated_at AS ua FROM maintree WHERE kind = 'note' ORDER BY updated_at DESC, created_at DESC, id"
         )
         return rows.map { (id: str($0, "id"), createdAtMs: int($0, "ca"), updatedAtMs: int($0, "ua")) }
     }
@@ -301,17 +337,17 @@ final class DataStore {
         return out
     }
 
-    /// 某一天区间内按倒序取一页 maintree（主列表用，含全部类型）
-    func fetchNoteTrees(startMs: Int64, endMs: Int64, limit: Int, offset: Int) throws -> [TreeRec] {
+    /// 笔记全局分页：按更新时间倒序取第 offset 起的一页（主列表标准页码翻页，仅 kind='note'）
+    func fetchNoteTreesPage(limit: Int, offset: Int) throws -> [TreeRec] {
         let rows = try query(
             """
             SELECT id, title, kind, created_at AS ca, updated_at AS ua, archived_at AS aa
             FROM maintree
-            WHERE updated_at >= ? AND updated_at < ?
+            WHERE kind = 'note'
             ORDER BY updated_at DESC, created_at DESC, id
             LIMIT ? OFFSET ?
             """,
-            [startMs, endMs, Int64(limit), Int64(offset)]
+            [Int64(limit), Int64(offset)]
         )
         var out: [TreeRec] = []
         for r in rows {
@@ -334,19 +370,33 @@ final class DataStore {
         return rows.map { chunk(from: $0) }
     }
 
-    /// 剪切板历史：取 clipboard 类型树下的全部 chunk，按更新时间倒序（分页）
-    func fetchClipboardHistory(limit: Int, offset: Int) throws -> [ClipboardHistoryItem] {
+    /// 剪切板历史：全部条目的更新时间倒序（用于按天分桶分页）
+    func clipboardHistoryUpdatedMsDesc() throws -> [Int64] {
+        let rows = try query(
+            """
+            SELECT c.updated_at AS ua
+            FROM chunk c
+            JOIN maintree m ON m.id = c.maintree_id
+            WHERE m.kind = 'clipboard'
+            ORDER BY c.updated_at DESC, c.created_at DESC, c.id
+            """
+        )
+        return rows.map { int($0, "ua") }
+    }
+
+    /// 剪切板历史：某天区间内的一页（时间区间翻页）
+    func fetchClipboardHistoryPage(startMs: Int64, endMs: Int64, limit: Int, offset: Int) throws -> [ClipboardHistoryItem] {
         let rows = try query(
             """
             SELECT c.id AS id, c.maintree_id AS tid, c.content, c.attachment AS at,
                    c.source_app AS sa, c.created_at AS ca, c.updated_at AS ua, c.last_copied_at AS lca
             FROM chunk c
             JOIN maintree m ON m.id = c.maintree_id
-            WHERE m.kind = 'clipboard'
+            WHERE m.kind = 'clipboard' AND c.updated_at >= ? AND c.updated_at < ?
             ORDER BY c.updated_at DESC, c.created_at DESC, c.id
             LIMIT ? OFFSET ?
             """,
-            [Int64(limit), Int64(offset)]
+            [startMs, endMs, Int64(limit), Int64(offset)]
         )
         return rows.map {
             ClipboardHistoryItem(
@@ -706,7 +756,8 @@ final class DataStore {
         let rows = try query(
             """
             SELECT c.id AS cid, c.maintree_id AS tid, c.content, c.source_app AS sa,
-                   c.updated_at AS cua, m.updated_at AS tua, m.title
+                   c.attachment AS at, c.updated_at AS cua, m.updated_at AS tua,
+                   m.title, m.kind
             FROM chunk c
             JOIN maintree m ON m.id = c.maintree_id
             WHERE LOWER(c.content) LIKE ? ESCAPE '\\' OR LOWER(m.title) LIKE ? ESCAPE '\\'
@@ -722,6 +773,8 @@ final class DataStore {
                 treeTitle: str($0, "title"),
                 content: str($0, "content"),
                 sourceApp: str($0, "sa"),
+                attachment: str($0, "at"),
+                treeKind: str($0, "kind"),
                 chunkUpdatedAtMs: int($0, "cua"),
                 treeUpdatedAtMs: int($0, "tua")
             )
@@ -847,6 +900,28 @@ final class DataStore {
         noteMutation()
     }
 
+    /// 批量取一组条目的标签：itemID -> [tagName]
+    func tagsGrouped(itemType: String, itemIDs: [String]) throws -> [String: [String]] {
+        guard !itemIDs.isEmpty else { return [:] }
+        let ph = itemIDs.map { _ in "?" }.joined(separator: ",")
+        var params: [Any?] = [itemType]
+        params.append(contentsOf: itemIDs)
+        let rows = try query(
+            """
+            SELECT it.item_id AS id, t.name AS name FROM item_tag it
+            JOIN tag t ON t.id = it.tag_id
+            WHERE it.item_type = ? AND it.item_id IN (\(ph))
+            ORDER BY it.created_at ASC, t.name ASC
+            """,
+            params
+        )
+        var out: [String: [String]] = [:]
+        for r in rows {
+            out[str(r, "id"), default: []].append(str(r, "name"))
+        }
+        return out
+    }
+
     /// 某条目的全部标签名
     func tagsForItem(itemType: String, itemID: String) throws -> [String] {
         let rows = try query(
@@ -902,19 +977,26 @@ final class DataStore {
         var total: Int { treeCount + chunkCount }
     }
 
-    /// 标签云：按引用条数倒序
+    /// 标签云：只统计笔记（kind='note'）及其分段上的标签，按引用条数倒序
     func tagCloud() throws -> [TagCloudEntry] {
         let rows = try query(
             """
             SELECT t.name AS name,
-                   (SELECT COUNT(*) FROM item_tag it WHERE it.tag_id = t.id AND it.item_type = 'tree') AS tc,
-                   (SELECT COUNT(*) FROM item_tag it WHERE it.tag_id = t.id AND it.item_type = 'chunk') AS cc
+                   (SELECT COUNT(*) FROM item_tag it
+                    JOIN maintree m ON m.id = it.item_id
+                    WHERE it.tag_id = t.id AND it.item_type = 'tree' AND m.kind = 'note') AS tc,
+                   (SELECT COUNT(*) FROM item_tag it
+                    JOIN chunk c ON c.id = it.item_id
+                    JOIN maintree m ON m.id = c.maintree_id
+                    WHERE it.tag_id = t.id AND it.item_type = 'chunk' AND m.kind = 'note') AS cc
             FROM tag t
             ORDER BY (tc + cc) DESC, t.name ASC
             LIMIT 200
             """
         )
-        return rows.map { TagCloudEntry(name: str($0, "name"), treeCount: Int(int($0, "tc")), chunkCount: Int(int($0, "cc"))) }
+        return rows
+            .map { TagCloudEntry(name: str($0, "name"), treeCount: Int(int($0, "tc")), chunkCount: Int(int($0, "cc"))) }
+            .filter { $0.total > 0 } // 过滤后引用数为 0 的孤儿标签（只挂在剪贴板树上）
     }
 
     /// 按标签名取所有相关树（树本身打标 或 其任一分段打标），按树更新时间倒序
@@ -927,7 +1009,7 @@ final class DataStore {
             LEFT JOIN chunk c ON c.maintree_id = m.id
             LEFT JOIN item_tag it_c ON it_c.item_type = 'chunk' AND it_c.item_id = c.id
             LEFT JOIN tag t_c ON t_c.id = it_c.tag_id
-            WHERE t_t.name = ? OR t_c.name = ?
+            WHERE (t_t.name = ? OR t_c.name = ?) AND m.kind = 'note'
             """,
             [name, name]
         )
@@ -961,7 +1043,7 @@ final class DataStore {
         let rows = try query(
             """
             SELECT m.id AS id, m.title AS title FROM maintree m
-            WHERE NOT EXISTS (
+            WHERE m.kind = 'note' AND NOT EXISTS (
                 SELECT 1 FROM item_tag it WHERE it.item_type = 'tree' AND it.item_id = m.id
             )
             ORDER BY m.updated_at DESC
@@ -976,6 +1058,8 @@ final class DataStore {
             let cs = try chunks(ofTree: tid)
             var parts: [String] = []
             if !title.isEmpty { parts.append("标题：\(title)") }
+            let sources = Set(cs.compactMap { $0.sourceApp.isEmpty ? nil : $0.sourceApp })
+            if !sources.isEmpty { parts.append("来源应用：\(sources.joined(separator: "、"))") }
             for c in cs {
                 if !c.attachment.isEmpty { parts.append("[图片附件] \(c.content)") }
                 else { parts.append(String(c.content.prefix(400))) }
@@ -997,6 +1081,8 @@ final class DataStore {
         let cs = try chunks(ofTree: treeID)
         var parts: [String] = []
         if !title.isEmpty { parts.append("标题：\(title)") }
+        let sources = Set(cs.compactMap { $0.sourceApp.isEmpty ? nil : $0.sourceApp })
+        if !sources.isEmpty { parts.append("来源应用：\(sources.joined(separator: "、"))") }
         for c in cs {
             if !c.attachment.isEmpty { parts.append("[图片附件] \(c.content)") }
             else { parts.append(String(c.content.prefix(400))) }

@@ -12,8 +12,10 @@ import Foundation
 final class SyncWatcher {
     private var timer: Timer?
     private var lastSeenMtime: TimeInterval?
-    /// 距本机最近一次写入至少超过该间隔才认为是「远端变更」
-    private let remoteQuietThreshold: TimeInterval = 1.5
+    /// 距本机最近一次写入至少超过该间隔才认为是「远端变更」。
+    /// 必须大于轮询间隔：否则下一次 tick（最多约 2s 后）会把本机写入误判成云端替换，
+    /// 关掉正在使用的连接；若此时文件还是 iCloud 占位，历史列表会被刷空。
+    private let remoteQuietThreshold: TimeInterval = 3.5
 
     func start() {
         guard timer == nil else { return }
@@ -32,6 +34,8 @@ final class SyncWatcher {
         guard AppModel.shared.store != nil else { return }
 
         let url = AppPaths.dbURL
+        // 文件还在下载或被截断时不要更新 lastSeen，下一轮继续等完整文件
+        guard DataStore.databaseFileIsReady(at: url) else { return }
         guard
             let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
             let mtime = (attrs[.modificationDate] as? Date)?.timeIntervalSinceReferenceDate

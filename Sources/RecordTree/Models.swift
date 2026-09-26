@@ -38,8 +38,12 @@ struct SearchResult {
     let treeTitle: String
     let content: String
     let sourceApp: String
+    let attachment: String
+    let treeKind: String
     let chunkUpdatedAtMs: Int64
     let treeUpdatedAtMs: Int64
+
+    var isImage: Bool { !attachment.isEmpty }
 }
 
 /// 一次变更影响（用于决定 Markdown 归档范围）

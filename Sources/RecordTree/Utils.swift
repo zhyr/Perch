@@ -214,7 +214,7 @@ enum TimeUtil {
         let cal = Calendar.current
         let start = cal.startOfDay(for: date(fromMs: ms))
         let end = cal.date(byAdding: .day, value: 1, to: start) ?? start
-        return (Int64(start.timeIntervalSince1970 * 1000), Int64(end.timeIntervalSince1970 * 1000))
+        return (millis(start), millis(end))
     }
 
     static func dayRangeMs(ofDayKey key: String) -> (start: Int64, end: Int64)? {
@@ -222,7 +222,13 @@ enum TimeUtil {
         let cal = Calendar.current
         let start = cal.startOfDay(for: d)
         let end = cal.date(byAdding: .day, value: 1, to: start) ?? start
-        return (Int64(start.timeIntervalSince1970 * 1000), Int64(end.timeIntervalSince1970 * 1000))
+        return (millis(start), millis(end))
+    }
+
+    /// 毫秒取整。直接截断 `timeInterval * 1000` 会在日界附近少 1ms，
+    /// 使分桶计数包含该条、SQL 区间却把它排除，历史页因此时有时无。
+    private static func millis(_ date: Date) -> Int64 {
+        Int64((date.timeIntervalSince1970 * 1000.0).rounded())
     }
 
     /// 今天 / 昨天 / M月d日 周x

@@ -88,6 +88,8 @@ struct ContentView: View {
     /// 是否已经针对当前关键词执行过搜索（用于区分“未输入/无结果”两种空态）
     @State private var searchHasRun = false
     @State private var searchWork: DispatchWorkItem?
+    /// 展开后在结果行内显示命中分段的正文
+    @State private var expandedSearchChunkID: String?
     /// 进入搜索界面后自动聚焦输入框，方便直接输入
     @FocusState private var searchFieldFocused: Bool
 
@@ -203,6 +205,7 @@ struct ContentView: View {
                     tagResultsView
                 }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(listGeometry)
             .overlay(alignment: .topLeading) { hoverCard }
             .overlay(alignment: .bottom) { toastView }
@@ -255,7 +258,7 @@ struct ContentView: View {
             }
         }
         .overlay {
-            if showDayJump, model.viewMode == .list {
+            if showDayJump, model.viewMode == .clipboardHistory {
                 dayJumpLayer
                     .transition(.opacity)
             }
@@ -320,7 +323,7 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - 日期跳转目录
+    // MARK: - 日期跳转目录（剪贴板历史用）
 
     private var dayJumpLayer: some View {
         ZStack {
@@ -346,26 +349,26 @@ struct ContentView: View {
 
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 2) {
-                        if model.hasNewer {
+                        if model.clipboardHasNewer {
                             dayJumpRow(
                                 icon: "bolt.fill",
                                 title: "最新记录",
                                 detail: "当前正停留在更早的日期",
                                 isCurrent: false
                             ) {
-                                model.goToNewestPage()
+                                model.goClipboardNewest()
                                 showDayJump = false
                             }
                         }
                         ForEach(model.dayJumpItems) { item in
                             dayJumpRow(
-                                icon: "doc.text",
+                                icon: "doc.on.clipboard",
                                 title: item.label,
                                 detail: "\(item.count) 条"
                                     + (item.pageCount > 1 ? " · 共 \(item.pageCount) 屏" : ""),
-                                isCurrent: item.dayKey == model.currentDayKey
+                                isCurrent: item.dayKey == model.clipboardCurrentDayKey
                             ) {
-                                model.jumpToDay(item.dayKey)
+                                model.jumpClipboardToDay(item.dayKey)
                                 showDayJump = false
                             }
                         }
@@ -962,7 +965,9 @@ struct ContentView: View {
         (NSApp.delegate as? AppDelegate)?.minimizePanel()
     }
 
-    /// 位置 1：应用图标 + 名称；位置 2：GitHub 开源仓库入口
+    /// 位置 1：应用图标 + 名称；位置 2：GitHub 开源仓库入口。
+    /// 标题与右侧按钮之间的空白由 AppDelegate 识别为拖拽区，不在这里插入 AppKit 视图，
+    /// 否则 NSView 会把标题栏撑高，打开历史页时整块内容被顶到窗口中部。
     private var titleBar: some View {
         HStack(spacing: 6) {
             trafficLights
@@ -975,7 +980,8 @@ struct ContentView: View {
             Text("\(AppInfo.zhName) \(AppInfo.enName)")
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundColor(.primary)
-            Spacer(minLength: 0)
+                .lineLimit(1)
+            Spacer(minLength: 8)
 
             // 剪切板历史入口（位置 1）
             Button(action: { model.showClipboardHistory() }) {
@@ -1639,15 +1645,14 @@ struct ContentView: View {
             Button {
                 model.goNewer()
             } label: {
-                Label("较新", systemImage: "chevron.left")
+                Label("上一页", systemImage: "chevron.left")
             }
             .disabled(!model.hasNewer)
-            .help("切到更新的记录")
+            .help("上一页（较新的记录）")
 
             Spacer(minLength: 4)
 
-            // 日期中心按钮：点击 mm/dd 周几 文本弹出“日期跳转目录”，在深翻页后也可一键回最新
-            let jumpable = model.dayJumpItems.count > 1
+            // 页码中心按钮：显示 第 X / N 页；点按一键回到第 1 页（最新记录）
             VStack(spacing: 2) {
                 Text(model.dayTitle).font(.headline)
                 Text(model.dayMetaText)
@@ -1656,26 +1661,20 @@ struct ContentView: View {
             }
             .contentShape(Rectangle())
             .onTapGesture {
-                if jumpable {
-                    showDayJump = true
-                } else {
-                    model.goToNewestPage()
-                }
+                model.goToNewestPage()
             }
-            .help(jumpable
-                  ? "点按跳转日期"
-                  : "回到最新记录所在的一屏")
-            .opacity(jumpable || model.hasNewer ? 1 : 0.55)
+            .help("回到第 1 页（最新记录）")
+            .opacity(model.hasNewer ? 1 : 0.55)
 
             Spacer(minLength: 4)
 
             Button {
                 model.goOlder()
             } label: {
-                Label("较旧", systemImage: "chevron.right")
+                Label("下一页", systemImage: "chevron.right")
             }
             .disabled(!model.hasOlder)
-            .help("切到更旧的记录")
+            .help("下一页（较旧的记录）")
         }
         .controlSize(.small)
         .padding(.leading, 12)
@@ -1750,38 +1749,7 @@ struct ContentView: View {
                         .padding(.vertical, 6)
 
                         ForEach(model.searchResults) { vm in
-                            Button {
-                                model.openSearchResult(
-                                    treeID: vm.result.treeID,
-                                    chunkID: vm.result.chunkID
-                                )
-                                searchText = ""
-                                searchHasRun = false
-                                searchWork?.cancel()
-                            } label: {
-                                HStack(alignment: .top, spacing: 8) {
-                                    VStack(alignment: .leading, spacing: 3) {
-                                        Text(vm.treeTitle)
-                                            .font(.system(size: 13, weight: .medium))
-                                            .lineLimit(1)
-                                        Text(vm.chunkPreview)
-                                            .font(.system(size: 12))
-                                            .lineLimit(1)
-                                            .foregroundColor(.secondary)
-                                        Text(vm.caption)
-                                            .font(.caption2)
-                                            .foregroundColor(.secondary)
-                                    }
-                                    Spacer(minLength: 0)
-                                    Image(systemName: "chevron.right")
-                                        .font(.system(size: 10))
-                                        .foregroundColor(.secondary)
-                                        .padding(.top, 2)
-                                }
-                                .padding(8)
-                                .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
+                            searchResultRow(vm)
                         }
                     }
                     .padding(.top, 2)
@@ -1789,8 +1757,89 @@ struct ContentView: View {
                 }
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(nsColor: .windowBackgroundColor))
         .onAppear { searchFieldFocused = true }
+    }
+
+    /// 搜索命中行。左侧点按展开正文；右侧是复制、保存到笔记和标签，不再只放一个跳走的箭头。
+    private func searchResultRow(_ vm: SearchResultVM) -> some View {
+        let expanded = expandedSearchChunkID == vm.id
+        return HStack(alignment: .top, spacing: 8) {
+            VStack(alignment: .leading, spacing: 3) {
+                if !vm.result.treeTitle.isEmpty {
+                    Text(vm.treeTitle)
+                        .font(.system(size: 13, weight: .medium))
+                        .lineLimit(1)
+                }
+                Text(vm.result.content)
+                    .font(.system(size: vm.result.treeTitle.isEmpty ? 13 : 12, weight: vm.result.treeTitle.isEmpty ? .medium : .regular))
+                    .foregroundColor(vm.result.treeTitle.isEmpty ? .primary : .secondary)
+                    .lineLimit(expanded ? 12 : 3)
+                    .fixedSize(horizontal: false, vertical: expanded)
+                Text(vm.caption)
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+            .onTapGesture {
+                expandedSearchChunkID = expanded ? nil : vm.id
+            }
+
+            VStack(alignment: .trailing, spacing: 4) {
+                HStack(spacing: 8) {
+                    searchHitButton(
+                        systemName: "doc.on.doc",
+                        help: "复制这条结果"
+                    ) {
+                        model.copySearchResult(vm.result)
+                    }
+                    searchHitButton(
+                        systemName: vm.isNote ? "checkmark.circle" : "square.and.arrow.down",
+                        help: vm.isNote ? "已是笔记" : "保存到笔记"
+                    ) {
+                        model.saveSearchResultAsNote(vm.result)
+                    }
+                    .disabled(vm.isNote)
+                    .opacity(vm.isNote ? 0.45 : 1)
+                }
+                if vm.tags.isEmpty {
+                    Text("无标签")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                } else {
+                    tagChips(vm.tags, compact: true)
+                }
+            }
+        }
+        .padding(8)
+        .contextMenu {
+            Button("复制内容") { model.copySearchResult(vm.result) }
+            Button("保存到笔记") { model.saveSearchResultAsNote(vm.result) }
+                .disabled(vm.isNote)
+            Button(expanded ? "收起详情" : "显示详情") {
+                expandedSearchChunkID = expanded ? nil : vm.id
+            }
+            Button("在列表中打开") {
+                model.openSearchResult(vm.result)
+                searchText = ""
+                searchHasRun = false
+                searchWork?.cancel()
+            }
+        }
+    }
+
+    private func searchHitButton(systemName: String, help: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: systemName)
+                .font(.system(size: 12))
+                .frame(width: 16, height: 16)
+        }
+        .buttonStyle(.plain)
+        .focusable(false)
+        .foregroundColor(.secondary)
+        .help(help)
     }
 
     private var searchBar: some View {
@@ -1845,6 +1894,7 @@ struct ContentView: View {
     private func runSearchNow(_ text: String) {
         let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
         searchWork?.cancel()
+        expandedSearchChunkID = nil
         searchHasRun = !t.isEmpty
         guard !t.isEmpty else {
             model.searchResults = []
@@ -1856,6 +1906,7 @@ struct ContentView: View {
     /// 输入即搜：防抖 260ms 后执行，避免高频按键压力
     private func scheduleSearch(_ text: String) {
         searchWork?.cancel()
+        expandedSearchChunkID = nil
         let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !t.isEmpty else {
             searchHasRun = false
@@ -1885,6 +1936,7 @@ struct ContentView: View {
                 )
             }
         )
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(nsColor: .windowBackgroundColor))
     }
 
@@ -1895,7 +1947,7 @@ struct ContentView: View {
             clipboardHistoryHeader
             Divider()
 
-            if model.clipboardHistoryItems.isEmpty {
+            if model.clipboardHistoryTotal == 0 {
                 VStack(spacing: 10) {
                     Spacer()
                     Image(systemName: "doc.on.clipboard")
@@ -1911,26 +1963,83 @@ struct ContentView: View {
                     Spacer()
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if model.clipboardHistoryItems.isEmpty {
+                VStack(spacing: 8) {
+                    Spacer()
+                    Text("这一屏没有记录")
+                        .font(.title3)
+                    Text("可用底栏翻到其它日期。")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    Spacer()
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                Divider()
+                clipboardBottomBar
             } else {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 2) {
                         ForEach(model.clipboardHistoryItems) { item in
                             clipboardHistoryRow(item)
                         }
-                        if model.clipboardHistoryHasMore {
-                            Button("加载更多") {
-                                model.loadMoreClipboardHistory()
-                            }
-                            .controlSize(.small)
-                            .padding(.vertical, 8)
-                            .frame(maxWidth: .infinity)
-                        }
                     }
                     .padding(8)
                 }
+                Divider()
+                clipboardBottomBar
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(nsColor: .windowBackgroundColor))
+    }
+
+    /// 剪贴板历史底栏：按时间区间（天）翻页，中心按钮弹出日期跳转目录
+    private var clipboardBottomBar: some View {
+        HStack(spacing: 10) {
+            Button {
+                model.goClipboardNewer()
+            } label: {
+                Label("较新", systemImage: "chevron.left")
+            }
+            .disabled(!model.clipboardHasNewer)
+            .help("切到更新的记录")
+
+            Spacer(minLength: 4)
+
+            let jumpable = model.dayJumpItems.count > 1
+            VStack(spacing: 2) {
+                Text(model.clipboardDayTitle).font(.headline)
+                Text(model.clipboardDayMetaText)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+            .contentShape(Rectangle())
+            .onTapGesture {
+                if jumpable {
+                    showDayJump = true
+                } else {
+                    model.goClipboardNewest()
+                }
+            }
+            .help(jumpable
+                  ? "点按跳转日期"
+                  : "回到最新记录所在的一屏")
+            .opacity(jumpable || model.clipboardHasNewer ? 1 : 0.55)
+
+            Spacer(minLength: 4)
+
+            Button {
+                model.goClipboardOlder()
+            } label: {
+                Label("较旧", systemImage: "chevron.right")
+            }
+            .disabled(!model.clipboardHasOlder)
+            .help("切到更旧的记录")
+        }
+        .controlSize(.small)
+        .padding(.leading, 12)
+        .padding(.trailing, 26) // 右侧预留右下角缩放手柄
+        .padding(.vertical, 6)
     }
 
     private var clipboardHistoryHeader: some View {

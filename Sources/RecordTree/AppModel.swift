@@ -61,14 +61,21 @@ struct SearchResultVM: Identifiable {
     let treeTitle: String
     let chunkPreview: String
     let caption: String
+    let isImage: Bool
+    let isNote: Bool
+    /// 该条命中的树标签 + 分段标签（去重，树在前）
+    let tags: [String]
 
-    init(result: SearchResult) {
+    init(result: SearchResult, tags: [String] = []) {
         self.result = result
         treeTitle = result.treeTitle.isEmpty
             ? PreviewUtil.makePreview(result.content)
             : result.treeTitle
         chunkPreview = PreviewUtil.makePreview(result.content)
         caption = "\(result.sourceApp) · 分段更新 \(TimeUtil.displayTime(result.chunkUpdatedAtMs))"
+        isImage = result.isImage
+        isNote = result.treeKind == "note"
+        self.tags = tags
     }
 }
 
@@ -120,15 +127,16 @@ final class AppModel: ObservableObject {
     static let shared = AppModel()
 
     private(set) var store: DataStore?
-    private var units: [PageUnit] = []
-    private var cursor = 0
+    /// 笔记列表：全局页码翻页（0 基，当前第 page+1 页）
+    private var notePage = 0
     private var latestMetas: [(id: String, createdAtMs: Int64, updatedAtMs: Int64)] = []
 
     @Published var rows: [TreeRowVM] = []
-    @Published var dayTitle = "暂无记录"
+    /// 笔记列表页码标题：第 X / N 页
+    @Published var dayTitle = "暂无笔记"
     @Published var dayMetaText = ""
-    /// 当前屏所在日期（yyyy-MM-dd），供日期跳转目录标记当前位置
-    @Published var currentDayKey = ""
+    @Published var noteTotal = 0
+    var notePageCount: Int { max(1, (noteTotal + Config.pageSize - 1) / Config.pageSize) }
     @Published var hasNewer = false
     @Published var hasOlder = false
     @Published var expandedTreeID: String?
@@ -146,16 +154,19 @@ final class AppModel: ObservableObject {
     @Published var overlayActive = false
     @Published var searchResults: [SearchResultVM] = []
 
-    // MARK: - 剪切板历史
+    // MARK: - 剪切板历史（按时间区间翻页）
     @Published var clipboardHistoryItems: [ClipboardHistoryItem] = []
-    @Published var clipboardHistoryCursor = 0
     @Published var clipboardHistoryTotal = 0
-    private let clipboardHistoryPageSize = 50
-    var clipboardHistoryHasMore: Bool {
-        clipboardHistoryCursor + clipboardHistoryItems.count < clipboardHistoryTotal
-    }
+    @Published var clipboardHasNewer = false
+    @Published var clipboardHasOlder = false
+    @Published var clipboardDayTitle = ""
+    @Published var clipboardDayMetaText = ""
+    /// 当前屏所在日期（yyyy-MM-dd），供剪贴板历史日期跳转目录标记当前位置
+    @Published var clipboardCurrentDayKey = ""
+    private var clipboardUnits: [PageUnit] = []
+    private var clipboardCursor = 0
 
-    /// 底部日期跳转目录（最新在上，每项一个“有记录的日子”）
+    /// 剪贴板历史的日期跳转目录（最新在上，每项一个“有记录的日子”）
     @Published var dayJumpItems: [DayJumpItem] = []
 
     /// 列表内单个记录的删除是否需要二次确认（默认开启：删除不可恢复，先确认再执行）
@@ -358,21 +369,32 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// 同步盘上的数据库被其它设备更新：关掉旧连接、重新打开并刷新界面
+    /// 同步盘上的数据库被其它设备更新：关掉旧连接、重新打开并刷新界面。
+    /// 打开失败时不再把已 close 的旧连接装回去（之后所有查询都会失败，列表变成空白）。
     func reloadFromRemoteChange() {
-        guard let old = store else { return }
+        guard store != nil else { return }
+        guard DataStore.databaseFileIsReady(at: AppPaths.dbURL) else {
+            NSLog("skip remote reload: database file not ready")
+            return
+        }
         do {
-            try old.close()
+            try store?.close()
         } catch {
             NSLog("close before remote reload failed: \(error)")
         }
+        store = nil
         do {
             store = try DataStore()
             reload()
+            refreshClipboardHistoryIfVisible()
             showToast("已同步其它设备的最新数据")
         } catch {
             NSLog("reload after remote change failed: \(error)")
-            store = old
+            store = try? DataStore()
+            if store != nil {
+                reload()
+                refreshClipboardHistoryIfVisible()
+            }
             showToast("云端数据重载失败")
         }
     }
@@ -408,34 +430,41 @@ final class AppModel: ObservableObject {
                 return
             }
             archive(info: info, kind: "复制自外部", content: content, source: source, atMs: at)
-            reload()
-            if viewMode == .clipboardHistory {
-                clipboardHistoryCursor = 0
-                loadClipboardHistory()
-            }
+            // 剪贴板采集只进「剪贴板历史」，不再触发笔记列表 reload（列表不展示 clipboard 树）
+            refreshClipboardHistoryIfVisible()
         } catch {
             NSLog("handleExternalCopy error: \(error)")
         }
     }
 
     /// 撤销一次“过短复制”的入库：删除对应分段；若该分段是树上唯一分段则整树一并删除。
-    /// 事件日志不写入“复制”记录（本就不该成为历史），只重写受影响天归档并刷新列表。
+    /// 事件日志不写入“复制”记录（本就不该成为历史），只重写受影响天归档。
+    /// 仅涉及 clipboard 树：无需 reload 笔记列表，正在浏览剪贴板历史时刷新该页。
     private func cleanUpTooShort(_ info: MutationInfo, content: String, source: String, atMs: Int64) {
         guard let store else { return }
         do {
             guard let deletion = try store.deleteChunk(info.chunkID ?? "") else {
-                reload()
+                refreshClipboardHistoryIfVisible()
                 return
             }
             for day in deletion.affectedDays {
                 try? store.rewriteDailyMarkdown(dayKey: day)
             }
             if expandedTreeID == deletion.treeID { expandedTreeID = nil }
-            reload()
+            refreshClipboardHistoryIfVisible()
             NSLog("已按规则清理过短复制（<\(Config.minCaptureTextLen) 字）：from \(source), content=\(content)")
         } catch {
             NSLog("cleanUpTooShort error: \(error)")
         }
+    }
+
+    /// 正在浏览「剪贴板历史」时重建分桶并尽量停留在当前日期与页码
+    private func refreshClipboardHistoryIfVisible() {
+        guard viewMode == .clipboardHistory else { return }
+        let curPage = clipboardUnits.indices.contains(clipboardCursor)
+            ? clipboardUnits[clipboardCursor].pageNo
+            : 0
+        rebuildClipboardUnits(keepingDay: clipboardCurrentDayKey, keepingPageNo: curPage)
     }
 
     func handleSelfCopy(chunkID: String) {
@@ -466,11 +495,8 @@ final class AppModel: ObservableObject {
             let text = Self.imageChunkText(width: img.width, height: img.height, bytes: img.pngData.count)
             let info = try store.performExternalImageCopy(content: text, attachment: rel, source: source, atMs: at)
             archive(info: info, kind: "复制图片（外部）", content: text, source: source, atMs: at)
-            reload()
-            if viewMode == .clipboardHistory {
-                clipboardHistoryCursor = 0
-                loadClipboardHistory()
-            }
+            // 同上：只影响剪贴板历史，无需 reload 笔记列表
+            refreshClipboardHistoryIfVisible()
         } catch {
             NSLog("handleExternalImageCopy error: \(error)")
         }
@@ -529,8 +555,7 @@ final class AppModel: ObservableObject {
             previousViewMode = viewMode
         }
         viewMode = .clipboardHistory
-        clipboardHistoryCursor = 0
-        loadClipboardHistory()
+        rebuildClipboardUnits(keepingDay: nil)
     }
 
     func exitClipboardHistory() {
@@ -538,28 +563,154 @@ final class AppModel: ObservableObject {
         previousViewMode = nil
     }
 
-    func loadClipboardHistory() {
+    /// 重建剪贴板历史的按天分桶分页结构。
+    /// keepingDay：数据变化后希望停留的日期（不存在则回落到最新一屏）。
+    /// keepingPageNo：希望停留的当天页码（0 基），不传则默认停留在该天第 1 屏。
+    private func rebuildClipboardUnits(keepingDay keepDayKey: String?, keepingPageNo: Int = 0) {
         guard let store else { return }
+        let times: [Int64]
         do {
-            clipboardHistoryTotal = try store.clipboardHistoryCount()
-            let items = try store.fetchClipboardHistory(
-                limit: clipboardHistoryPageSize,
-                offset: clipboardHistoryCursor
-            )
-            if clipboardHistoryCursor == 0 {
-                clipboardHistoryItems = items
-            } else {
-                clipboardHistoryItems.append(contentsOf: items)
-            }
+            times = try store.clipboardHistoryUpdatedMsDesc()
         } catch {
-            NSLog("loadClipboardHistory error: \(error)")
+            // 查询失败时保留当前列表。原先用 try? 得到空数组，界面会显示成“暂无历史”。
+            NSLog("rebuildClipboardUnits error: \(error)")
+            return
         }
+        clipboardHistoryTotal = times.count
+
+        var buckets: [DayBucket] = []
+        for t in times {
+            let range = TimeUtil.dayRangeMs(t)
+            if var last = buckets.last, last.startMs == range.start {
+                last.count += 1
+                buckets[buckets.count - 1] = last
+            } else {
+                buckets.append(
+                    DayBucket(key: TimeUtil.dayKey(range.start), startMs: range.start, endMs: range.end, count: 1)
+                )
+            }
+        }
+        dayJumpItems = buckets.map { b in
+            let pages = max(1, (b.count + Config.pageSize - 1) / Config.pageSize)
+            return DayJumpItem(
+                dayKey: b.key,
+                label: TimeUtil.dayLabel(ms: b.startMs),
+                count: b.count,
+                pageCount: pages
+            )
+        }
+
+        var newUnits: [PageUnit] = []
+        for b in buckets {
+            let pages = max(1, (b.count + Config.pageSize - 1) / Config.pageSize)
+            for p in 0..<pages {
+                let off = p * Config.pageSize
+                let cnt = min(Config.pageSize, b.count - off)
+                newUnits.append(
+                    PageUnit(
+                        dayKey: b.key,
+                        dayStartMs: b.startMs,
+                        dayEndMs: b.endMs,
+                        dayCount: b.count,
+                        offsetInDay: off,
+                        count: cnt,
+                        pageNo: p,
+                        pagesInDay: pages
+                    )
+                )
+            }
+        }
+        clipboardUnits = newUnits
+
+        // 尽量停留在原来的天 + 原来的页码；若天数或页码已不存在，则回退到合理位置
+        if let keep = keepDayKey, !keep.isEmpty, !clipboardUnits.isEmpty {
+            let targetPage = max(0, keepingPageNo)
+            if let idx = clipboardUnits.firstIndex(where: { $0.dayKey == keep && $0.pageNo == targetPage }) {
+                // 精确命中：天 + 页码都还在
+                clipboardCursor = idx
+            } else if let firstOfDay = clipboardUnits.firstIndex(where: { $0.dayKey == keep }) {
+                // 当天还在，但目标页码不存在（如当天记录数变少），回退到该天最后一页
+                let lastOfDay = clipboardUnits.lastIndex(where: { $0.dayKey == keep }) ?? firstOfDay
+                clipboardCursor = lastOfDay
+            } else if let firstEarlier = clipboardUnits.firstIndex(where: { $0.dayKey < keep }) {
+                // 目标天不存在（如该天记录被清空），跳到紧邻的更早一天的首页
+                clipboardCursor = firstEarlier
+            } else {
+                // 目标天比所有现存天都还老 → 跳到最老一屏
+                clipboardCursor = clipboardUnits.count - 1
+            }
+        } else {
+            clipboardCursor = 0
+        }
+        // 边界保护
+        if clipboardCursor >= clipboardUnits.count {
+            clipboardCursor = max(0, clipboardUnits.count - 1)
+        }
+        if clipboardCursor < 0 {
+            clipboardCursor = 0
+        }
+        loadClipboardPage()
     }
 
-    func loadMoreClipboardHistory() {
-        guard clipboardHistoryHasMore else { return }
-        clipboardHistoryCursor += clipboardHistoryPageSize
-        loadClipboardHistory()
+    private func loadClipboardPage() {
+        guard let store, !clipboardUnits.isEmpty else {
+            clipboardHistoryItems = []
+            clipboardDayTitle = ""
+            clipboardDayMetaText = ""
+            clipboardCurrentDayKey = ""
+            clipboardHasNewer = false
+            clipboardHasOlder = false
+            return
+        }
+        let u = clipboardUnits[clipboardCursor]
+        do {
+            clipboardHistoryItems = try store.fetchClipboardHistoryPage(
+                startMs: u.dayStartMs,
+                endMs: u.dayEndMs,
+                limit: u.count,
+                offset: u.offsetInDay
+            )
+        } catch {
+            NSLog("loadClipboardPage error: \(error)")
+            return
+        }
+        clipboardCurrentDayKey = u.dayKey
+        clipboardDayTitle = TimeUtil.titleDate(ms: u.dayStartMs)
+        clipboardDayMetaText = u.pagesInDay > 1
+            ? "共 \(u.dayCount) 条 · 第 \(u.pageNo + 1)/\(u.pagesInDay) 屏"
+            : "共 \(u.dayCount) 条"
+        clipboardHasNewer = clipboardCursor > 0
+        clipboardHasOlder = clipboardCursor < clipboardUnits.count - 1
+    }
+
+    // MARK: - 剪贴板历史翻页
+
+    func goClipboardNewer() {
+        guard clipboardCursor > 0 else { return }
+        clipboardCursor -= 1
+        loadClipboardPage()
+    }
+
+    func goClipboardOlder() {
+        guard clipboardCursor < clipboardUnits.count - 1 else { return }
+        clipboardCursor += 1
+        loadClipboardPage()
+    }
+
+    /// 回到最新记录所在的一屏
+    func goClipboardNewest() {
+        guard clipboardCursor > 0 else { return }
+        clipboardCursor = 0
+        loadClipboardPage()
+    }
+
+    /// 跳到指定日期的第一屏（日期目录项来自 dayJumpItems）
+    func jumpClipboardToDay(_ dayKey: String) {
+        guard let idx = clipboardUnits.firstIndex(where: { $0.dayKey == dayKey && $0.pageNo == 0 }) else {
+            return
+        }
+        clipboardCursor = idx
+        loadClipboardPage()
     }
 
     /// 复制剪切板历史中的某条记录
@@ -643,8 +794,7 @@ final class AppModel: ObservableObject {
             for day in summary.dayKeys {
                 try? store.rewriteDailyMarkdown(dayKey: day)
             }
-            clipboardHistoryCursor = 0
-            loadClipboardHistory()
+            rebuildClipboardUnits(keepingDay: nil)
             reload()
             showToast("已清空剪切板历史（\(summary.treeIDs.count) 条）")
         } catch {
@@ -903,21 +1053,88 @@ final class AppModel: ObservableObject {
         }
         do {
             let raw = try store.searchChunks(keyword: term)
-            searchResults = raw.map { SearchResultVM(result: $0) }
+            let treeTags = (try? store.tagsGrouped(itemType: "tree", itemIDs: Array(Set(raw.map(\.treeID))))) ?? [:]
+            let chunkTags = (try? store.tagsGrouped(itemType: "chunk", itemIDs: raw.map(\.chunkID))) ?? [:]
+            searchResults = raw.map { result in
+                var seen = Set<String>()
+                var tags: [String] = []
+                for name in (treeTags[result.treeID] ?? []) + (chunkTags[result.chunkID] ?? []) {
+                    if seen.insert(name).inserted { tags.append(name) }
+                }
+                return SearchResultVM(result: result, tags: tags)
+            }
         } catch {
             NSLog("performSearch error: \(error)")
             searchResults = []
         }
     }
 
-    func openSearchResult(treeID: String, chunkID: String) {
-        reload() // 确保分页单位最新
-        guard latestMetas.contains(where: { $0.id == treeID }) else { return }
-        highlightedChunkID = chunkID
-        revealTree(treeID, expand: true)
-        viewMode = .list
+    func openSearchResult(_ result: SearchResult) {
+        if result.treeKind == "note" {
+            // 笔记类型：跳转到主列表并定位
+            reload() // 确保分页单位最新
+            guard latestMetas.contains(where: { $0.id == result.treeID }) else { return }
+            highlightedChunkID = result.chunkID
+            revealTree(result.treeID, expand: true)
+            viewMode = .list
+        } else {
+            // 剪贴板类型：跳转到剪贴板历史并定位到对应条目所在日期
+            let dayKey = TimeUtil.dayKey(result.chunkUpdatedAtMs)
+            rebuildClipboardUnits(keepingDay: dayKey)
+            viewMode = .clipboardHistory
+        }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { [weak self] in
             self?.highlightedChunkID = nil
+        }
+    }
+
+    /// 把搜索命中保存为笔记。已经是笔记的不再复制一份。
+    @discardableResult
+    func saveSearchResultAsNote(_ result: SearchResult) -> Bool {
+        guard result.treeKind != "note" else {
+            showToast("这条已在笔记中")
+            return false
+        }
+        let item = ClipboardHistoryItem(
+            id: result.chunkID,
+            treeID: result.treeID,
+            content: result.content,
+            attachment: result.attachment,
+            sourceApp: result.sourceApp,
+            createdAtMs: result.chunkUpdatedAtMs,
+            updatedAtMs: result.chunkUpdatedAtMs,
+            lastCopiedMs: nil
+        )
+        return archiveClipboardItemAsNote(item)
+    }
+
+    /// 复制搜索结果的内容
+    func copySearchResult(_ result: SearchResult) {
+        if result.isImage {
+            // 图片：尝试回写原图
+            if let url = AppPaths.attachmentURL(relativePath: result.attachment),
+               let png = try? Data(contentsOf: url) {
+                let pbItem = NSPasteboardItem()
+                guard pbItem.setData(png, forType: .png) else {
+                    showToast("复制失败")
+                    return
+                }
+                if let img = NSImage(data: png), let tiff = img.tiffRepresentation {
+                    pbItem.setData(tiff, forType: .tiff)
+                }
+                pbItem.setString(result.chunkID, forType: ClipboardImage.selfCopyMarkerType)
+                let pb = NSPasteboard.general
+                pb.clearContents()
+                guard pb.writeObjects([pbItem]) else {
+                    showToast("复制失败")
+                    return
+                }
+                showToast("已复制图片")
+            } else {
+                writeAndFlag(content: result.content, chunkID: result.chunkID, feedback: "已复制")
+            }
+        } else {
+            writeAndFlag(content: result.content, chunkID: result.chunkID, feedback: "已复制")
         }
     }
 
@@ -1086,24 +1303,24 @@ final class AppModel: ObservableObject {
         showToast("已复制图片")
     }
 
-    // MARK: - 分页导航
+    // MARK: - 分页导航（笔记列表：全局页码翻页）
 
-    /// scroll：是否同时滚动到新屏顶部（键盘翻页时由键盘焦点接管定位，传 false）
+    /// scroll：是否同时滚动到新页顶部（键盘翻页时由键盘焦点接管定位，传 false）
     func goNewer(scroll: Bool = true) {
-        guard cursor > 0 else { return }
-        cursor -= 1
+        guard notePage > 0 else { return }
+        notePage -= 1
         expandedTreeID = nil
         highlightedChunkID = nil
         loadPage()
         if scroll {
-            // 翻页后固定回到该屏顶部，避免停留在上一屏的滚动深度造成“原地跳变”
+            // 翻页后固定回到该页顶部，避免停留在上一页的滚动深度造成“原地跳变”
             scrollTargetTreeID = rows.first?.id
         }
     }
 
     func goOlder(scroll: Bool = true) {
-        guard cursor < units.count - 1 else { return }
-        cursor += 1
+        guard notePage < notePageCount - 1 else { return }
+        notePage += 1
         expandedTreeID = nil
         highlightedChunkID = nil
         loadPage()
@@ -1112,22 +1329,21 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// 直接回到最新记录所在的那一屏
-    func goToNewestPage() {
-        guard cursor > 0 else { return }
-        cursor = 0
+    /// 跳到指定页码（1 基）
+    func goToPage(_ page1: Int) {
+        let p = max(1, min(page1, notePageCount)) - 1
+        guard p != notePage else { return }
+        notePage = p
         expandedTreeID = nil
         highlightedChunkID = nil
         loadPage()
         scrollTargetTreeID = rows.first?.id
     }
 
-    /// 跳到指定日期的第一屏（日期目录项来自 dayJumpItems）
-    func jumpToDay(_ dayKey: String) {
-        guard let idx = units.firstIndex(where: { $0.dayKey == dayKey && $0.pageNo == 0 }) else {
-            return
-        }
-        cursor = idx
+    /// 直接回到第 1 页（最新记录）
+    func goToNewestPage() {
+        guard notePage > 0 else { return }
+        notePage = 0
         expandedTreeID = nil
         highlightedChunkID = nil
         loadPage()
@@ -1143,8 +1359,8 @@ final class AppModel: ObservableObject {
         scrollTargetTreeID = nil
     }
 
-    /// 数据变更引发列表重排后，把当前页切换到包含 treeID 的那一屏，并请求滚动到该记录。
-    /// 必须在 reload()（latestMetas / units / rows 已更新）之后调用。
+    /// 数据变更引发列表重排后，把当前页切换到包含 treeID 的那一页，并请求滚动到该记录。
+    /// 必须在 reload()（latestMetas / rows 已更新）之后调用。
     func revealTree(_ treeID: String, expand: Bool) {
         guard store != nil,
               let idx = latestMetas.firstIndex(where: { $0.id == treeID })
@@ -1152,17 +1368,9 @@ final class AppModel: ObservableObject {
             if expand { expandedTreeID = nil }
             return
         }
-        let meta = latestMetas[idx]
-        let range = TimeUtil.dayRangeMs(meta.updatedAtMs)
-        let dayKey = TimeUtil.dayKey(meta.updatedAtMs)
-        let rank = latestMetas[0..<idx].filter { $0.updatedAtMs >= range.start && $0.updatedAtMs < range.end }.count
-        let pageNo = rank / Config.pageSize
-        guard let unitIdx = units.firstIndex(where: { $0.dayKey == dayKey && $0.pageNo == pageNo }) else {
-            if expand { expandedTreeID = nil }
-            return
-        }
-        if cursor != unitIdx {
-            cursor = unitIdx
+        let page = idx / Config.pageSize
+        if notePage != page {
+            notePage = page
             loadPage()
         }
         if expand { expandedTreeID = treeID }
@@ -1179,56 +1387,13 @@ final class AppModel: ObservableObject {
         do {
             let metas = try store.allNoteTreeMetas()
             latestMetas = metas
-            var buckets: [DayBucket] = []
-            for m in metas {
-                let range = TimeUtil.dayRangeMs(m.updatedAtMs)
-                if var last = buckets.last, last.startMs == range.start {
-                    last.count += 1
-                    buckets[buckets.count - 1] = last
-                } else {
-                    buckets.append(
-                        DayBucket(
-                            key: TimeUtil.dayKey(range.start),
-                            startMs: range.start,
-                            endMs: range.end,
-                            count: 1
-                        )
-                    )
-                }
+            noteTotal = metas.count
+            // 边界保护：确保当前页在有效范围内
+            if notePage >= notePageCount {
+                notePage = notePageCount - 1
             }
-            dayJumpItems = buckets.map { b in
-                let pages = max(1, (b.count + Config.pageSize - 1) / Config.pageSize)
-                return DayJumpItem(
-                    dayKey: b.key,
-                    label: TimeUtil.dayLabel(ms: b.startMs),
-                    count: b.count,
-                    pageCount: pages
-                )
-            }
-
-            var newUnits: [PageUnit] = []
-            for b in buckets {
-                let pages = max(1, (b.count + Config.pageSize - 1) / Config.pageSize)
-                for p in 0..<pages {
-                    let off = p * Config.pageSize
-                    let cnt = min(Config.pageSize, b.count - off)
-                    newUnits.append(
-                        PageUnit(
-                            dayKey: b.key,
-                            dayStartMs: b.startMs,
-                            dayEndMs: b.endMs,
-                            dayCount: b.count,
-                            offsetInDay: off,
-                            count: cnt,
-                            pageNo: p,
-                            pagesInDay: pages
-                        )
-                    )
-                }
-            }
-            units = newUnits
-            if cursor >= units.count {
-                cursor = max(0, units.count - 1)
+            if notePage < 0 {
+                notePage = 0
             }
             loadPage()
         } catch {
@@ -1239,12 +1404,11 @@ final class AppModel: ObservableObject {
 
     private func clearRows() {
         rows = []
-        dayTitle = "暂无记录"
+        dayTitle = "暂无笔记"
         dayMetaText = ""
-        currentDayKey = ""
+        noteTotal = 0
         hasNewer = false
         hasOlder = false
-        dayJumpItems = []
     }
 
     private func loadPage() {
@@ -1252,17 +1416,14 @@ final class AppModel: ObservableObject {
             clearRows()
             return
         }
-        guard !units.isEmpty else {
+        guard noteTotal > 0 else {
             clearRows()
             return
         }
-        let u = units[cursor]
         guard
-            let trees = try? store.fetchNoteTrees(
-                startMs: u.dayStartMs,
-                endMs: u.dayEndMs,
-                limit: u.count,
-                offset: u.offsetInDay
+            let trees = try? store.fetchNoteTreesPage(
+                limit: Config.pageSize,
+                offset: notePage * Config.pageSize
             )
         else {
             clearRows()
@@ -1277,23 +1438,20 @@ final class AppModel: ObservableObject {
                 return r
             }
         }
-        currentDayKey = u.dayKey
-        dayTitle = TimeUtil.titleDate(ms: u.dayStartMs)
-        dayMetaText = u.pagesInDay > 1
-            ? "共 \(u.dayCount) 条 · 第 \(u.pageNo + 1)/\(u.pagesInDay) 屏"
-            : "共 \(u.dayCount) 条 · 全部"
-        hasNewer = cursor > 0
-        hasOlder = cursor < units.count - 1
+        dayTitle = "第 \(notePage + 1) / \(notePageCount) 页"
+        dayMetaText = "共 \(noteTotal) 条笔记"
+        hasNewer = notePage > 0
+        hasOlder = notePage < notePageCount - 1
     }
 
-    /// 变更后若树的归属天与当前显示天不同，跳到新归属天的第一页（通常在今天）
+    /// 变更后若树所在的页与当前页不同，跳到包含该树的页（编辑/追加会把树顶到最前，通常回到第 1 页）
     private func relocateIfNeeded(_ info: MutationInfo) {
-        guard !units.isEmpty else { return }
-        let currentKey = units[cursor].dayKey
-        guard currentKey != info.newDay else { return }
-        if let idx = units.firstIndex(where: { $0.dayKey == info.newDay && $0.pageNo == 0 }) {
-            cursor = idx
+        guard let idx = latestMetas.firstIndex(where: { $0.id == info.treeID }) else { return }
+        let page = idx / Config.pageSize
+        if notePage != page {
+            notePage = page
             loadPage()
+            scrollTargetTreeID = rows.first?.id
         }
     }
 

@@ -61,6 +61,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupGlobalShortcut()
         setupEscapeToHide()
         setupEditShortcutsFallback()
+        installTitlebarDrag()
         installScrollSuppression()
         monitor.start()
         syncWatcher.start()
@@ -185,6 +186,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel?.isKeyWindow ?? false
     }
 
+    /// 无边框面板的内容是一整块 SwiftUI，点标题栏到不了窗口背景，
+    /// `isMovableByWindowBackground` 因此无效。在鼠标按下时判断是否落在
+    /// 标题栏空白（红绿灯与右侧按钮之间），再用屏幕坐标移动窗口。
+    /// 不往 SwiftUI 里塞 NSView，避免把标题栏撑到窗口中部。
+    private func installTitlebarDrag() {
+        NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { [weak self] event in
+            guard let self, self.isTitlebarDrag(event) else { return event }
+            self.dragPanel(from: event)
+            return nil
+        }
+    }
+
+    /// 标题行大约 34pt。左侧 56pt 留给红绿灯，右侧约 196pt 留给图标按钮。
+    private func isTitlebarDrag(_ event: NSEvent) -> Bool {
+        guard event.window === panel, let content = panel.contentView else { return false }
+        let p = event.locationInWindow
+        let b = content.bounds
+        guard p.y >= b.maxY - 34, p.y <= b.maxY else { return false }
+        guard p.x >= 56, p.x <= b.maxX - 196 else { return false }
+        return true
+    }
+
+    private func dragPanel(from event: NSEvent) {
+        let startMouse = NSEvent.mouseLocation
+        let startOrigin = panel.frame.origin
+        panel.trackEvents(
+            matching: [.leftMouseDragged, .leftMouseUp],
+            timeout: .greatestFiniteMagnitude,
+            mode: .eventTracking
+        ) { next, stop in
+            guard let next else {
+                stop.pointee = true
+                return
+            }
+            switch next.type {
+            case .leftMouseUp:
+                stop.pointee = true
+            case .leftMouseDragged:
+                let mouse = NSEvent.mouseLocation
+                self.panel.setFrameOrigin(NSPoint(
+                    x: startOrigin.x + (mouse.x - startMouse.x),
+                    y: startOrigin.y + (mouse.y - startMouse.y)
+                ))
+            default:
+                break
+            }
+        }
+    }
+
     /// 列表滚动时临时抑制悬停高亮/预览：
     /// 鼠标不动而列表内容滚动会令指针持续跨过各行，逐行触发 hover 导致整棵视图反复重算，
     /// 表现为滚动抖动。滚轮事件后 0.35s 内抑制，停顿后自动恢复。
@@ -256,7 +306,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         win.titleVisibility = .hidden
         win.titlebarAppearsTransparent = true
         win.isReleasedWhenClosed = false
-        win.isMovableByWindowBackground = true   // 按住空白处长按拖拽即可移动
+        win.isMovableByWindowBackground = true   // 点到真正的窗口背景时仍可拖；标题栏由 WindowDragArea 负责
         win.level = .floating                    // 悬浮在普通窗口之上
         win.hidesOnDeactivate = false            // 点击其它应用时不自动消失
         win.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]

@@ -13,6 +13,11 @@ let package = Package(
                 .linkedFramework("SwiftUI"),
                 .linkedFramework("ServiceManagement"),
             ]
+        ),
+        .testTarget(
+            name: "RecordTreeTests",
+            dependencies: ["RecordTree"],
+            path: "Tests/RecordTreeTests"
         )
     ]
 )
