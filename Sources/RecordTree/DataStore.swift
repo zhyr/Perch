@@ -370,46 +370,57 @@ final class DataStore {
         return rows.map { chunk(from: $0) }
     }
 
-    /// 剪切板历史：全部条目的更新时间倒序（用于按天分桶分页）
-    func clipboardHistoryUpdatedMsDesc() throws -> [Int64] {
-        let rows = try query(
-            """
-            SELECT c.updated_at AS ua
-            FROM chunk c
-            JOIN maintree m ON m.id = c.maintree_id
-            WHERE m.kind = 'clipboard'
-            ORDER BY c.updated_at DESC, c.created_at DESC, c.id
-            """
-        )
-        return rows.map { int($0, "ua") }
-    }
+    /// 剪切板历史列表：按内容去重后的最近 limit 条（同一内容只保留最近一次出现）。
+    /// 图片按附件路径区分，避免不同图片因说明文字相同被错误合并。
+    ///
+    /// - 只按更新时间倒序分批取行（每批带 LIMIT/OFFSET），凑够 limit 条去重结果即停，
+    ///   不再把全量历史拉回主线程分桶（旧实现每次切 tab 都要扫全表）。
+    ///   实测 13.5k 条数据下第一批 400 行就足以得到 99 条去重结果。
+    /// - 库里数据一条都不删，超出 limit 的旧记录仍可通过 searchChunks 搜索到。
+    func fetchClipboardRecentUnique(limit: Int) throws -> [ClipboardHistoryItem] {
+        guard limit > 0 else { return [] }
+        // 每批多取 100 行：正常情况下第一批就能凑够 limit 条去重结果
+        let batch = limit + 100
+        var items: [ClipboardHistoryItem] = []
+        var seen = Set<String>()
+        var offset = 0
 
-    /// 剪切板历史：某天区间内的一页（时间区间翻页）
-    func fetchClipboardHistoryPage(startMs: Int64, endMs: Int64, limit: Int, offset: Int) throws -> [ClipboardHistoryItem] {
-        let rows = try query(
-            """
-            SELECT c.id AS id, c.maintree_id AS tid, c.content, c.attachment AS at,
-                   c.source_app AS sa, c.created_at AS ca, c.updated_at AS ua, c.last_copied_at AS lca
-            FROM chunk c
-            JOIN maintree m ON m.id = c.maintree_id
-            WHERE m.kind = 'clipboard' AND c.updated_at >= ? AND c.updated_at < ?
-            ORDER BY c.updated_at DESC, c.created_at DESC, c.id
-            LIMIT ? OFFSET ?
-            """,
-            [startMs, endMs, Int64(limit), Int64(offset)]
-        )
-        return rows.map {
-            ClipboardHistoryItem(
-                id: str($0, "id"),
-                treeID: str($0, "tid"),
-                content: str($0, "content"),
-                attachment: str($0, "at"),
-                sourceApp: str($0, "sa"),
-                createdAtMs: int($0, "ca"),
-                updatedAtMs: int($0, "ua"),
-                lastCopiedMs: intOpt($0, "lca")
+        while items.count < limit {
+            let rows = try query(
+                """
+                SELECT c.id AS id, c.maintree_id AS tid, c.content AS content, c.attachment AS at,
+                       c.source_app AS sa, c.created_at AS ca, c.updated_at AS ua, c.last_copied_at AS lca
+                FROM chunk c
+                JOIN maintree m ON m.id = c.maintree_id
+                WHERE m.kind = 'clipboard'
+                ORDER BY c.updated_at DESC, c.created_at DESC, c.id
+                LIMIT ? OFFSET ?
+                """,
+                [Int64(batch), Int64(offset)]
             )
+            if rows.isEmpty { break }
+
+            for row in rows {
+                let item = ClipboardHistoryItem(
+                    id: str(row, "id"),
+                    treeID: str(row, "tid"),
+                    content: str(row, "content"),
+                    attachment: str(row, "at"),
+                    sourceApp: str(row, "sa"),
+                    createdAtMs: int(row, "ca"),
+                    updatedAtMs: int(row, "ua"),
+                    lastCopiedMs: intOpt(row, "lca")
+                )
+                // 同一内容只保留最近一次出现；图片用附件路径区分
+                if seen.insert(item.dedupeKey).inserted {
+                    items.append(item)
+                    if items.count == limit { break }
+                }
+            }
+            if rows.count < batch { break }
+            offset += batch
         }
+        return items
     }
 
     /// 剪切板历史总条数
@@ -977,18 +988,19 @@ final class DataStore {
         var total: Int { treeCount + chunkCount }
     }
 
-    /// 标签云：只统计笔记（kind='note'）及其分段上的标签，按引用条数倒序
+    /// 标签云：统计全部标签（记录级 + 分段级）的引用条数，按条数倒序。
+    /// 不能只统计 kind='note'：主列表切到仅笔记后，历史标签仍可能挂在剪贴板记录上，
+    /// 只按笔记过滤会让这些标签的计数变成 0、最终在标签云里彻底消失。
     func tagCloud() throws -> [TagCloudEntry] {
         let rows = try query(
             """
             SELECT t.name AS name,
                    (SELECT COUNT(*) FROM item_tag it
                     JOIN maintree m ON m.id = it.item_id
-                    WHERE it.tag_id = t.id AND it.item_type = 'tree' AND m.kind = 'note') AS tc,
+                    WHERE it.tag_id = t.id AND it.item_type = 'tree') AS tc,
                    (SELECT COUNT(*) FROM item_tag it
                     JOIN chunk c ON c.id = it.item_id
-                    JOIN maintree m ON m.id = c.maintree_id
-                    WHERE it.tag_id = t.id AND it.item_type = 'chunk' AND m.kind = 'note') AS cc
+                    WHERE it.tag_id = t.id AND it.item_type = 'chunk') AS cc
             FROM tag t
             ORDER BY (tc + cc) DESC, t.name ASC
             LIMIT 200
@@ -996,7 +1008,7 @@ final class DataStore {
         )
         return rows
             .map { TagCloudEntry(name: str($0, "name"), treeCount: Int(int($0, "tc")), chunkCount: Int(int($0, "cc"))) }
-            .filter { $0.total > 0 } // 过滤后引用数为 0 的孤儿标签（只挂在剪贴板树上）
+            .filter { $0.total > 0 } // 过滤没有任何有效引用（悬空 item_tag）的标签
     }
 
     /// 按标签名取所有相关树（树本身打标 或 其任一分段打标），按树更新时间倒序
@@ -1009,7 +1021,7 @@ final class DataStore {
             LEFT JOIN chunk c ON c.maintree_id = m.id
             LEFT JOIN item_tag it_c ON it_c.item_type = 'chunk' AND it_c.item_id = c.id
             LEFT JOIN tag t_c ON t_c.id = it_c.tag_id
-            WHERE (t_t.name = ? OR t_c.name = ?) AND m.kind = 'note'
+            WHERE t_t.name = ? OR t_c.name = ?
             """,
             [name, name]
         )

@@ -1,6 +1,12 @@
 import SwiftUI
 import AppKit
 
+/// 标题栏右侧按钮组的最左边界（窗口内容区坐标，左上角为原点）。
+/// AppDelegate 据此划定可拖拽区，避免硬编码宽度把按钮点击误判为窗口拖动。
+enum TitleBarLayout {
+    static var rightButtonGroupMinX: CGFloat?
+}
+
 private struct TreeHoverFrameKey: PreferenceKey {
     static var defaultValue: CGRect? = nil
     static func reduce(value: inout CGRect?, nextValue: () -> CGRect?) {
@@ -110,6 +116,9 @@ struct ContentView: View {
     // 多选删除：进入多选模式后可勾选多条记录批量删除
     @State private var multiSelectActive = false
     @State private var selectedTreeIDs: Set<String> = []
+
+    /// 剪贴板历史行悬停：仅悬停行显示单条删除按钮
+    @State private var hoveredClipboardItemID: String?
 
     // 悬停浮层（全局坐标）
     @State private var hoverTreeFrame: CGRect?
@@ -243,7 +252,9 @@ struct ContentView: View {
             idealHeight: Config.panelHeight,
             maxHeight: Config.panelMaxHeight
         )
-        .background(Color(nsColor: .windowBackgroundColor))
+        .coordinateSpace(name: "perchWindow")
+        .tint(DS.Color.brand)
+        .background(DS.Color.background)
         .overlay(alignment: .bottomTrailing) { resizeHandle }
         .overlay {
             if confirmDelete != nil {
@@ -283,6 +294,7 @@ struct ContentView: View {
         .onChange(of: model.viewMode) { _ in
             keyboardFocusedTreeID = nil
             showDayJump = false
+            hoveredClipboardItemID = nil
             // 离开主列表时退出多选，避免残留勾选状态
             if model.viewMode != .list {
                 resetMultiSelect()
@@ -311,7 +323,7 @@ struct ContentView: View {
 
     private var deleteConfirmLayer: some View {
         ZStack {
-            Color.black.opacity(0.12)
+            DS.Color.scrim
                 .onTapGesture { confirmDelete = nil }
             if let req = confirmDelete {
                 DeleteConfirmDialog(
@@ -327,14 +339,14 @@ struct ContentView: View {
 
     private var dayJumpLayer: some View {
         ZStack {
-            Color.black.opacity(0.10)
+            DS.Color.scrim
                 .onTapGesture { showDayJump = false }
 
             VStack(spacing: 0) {
                 HStack(spacing: 6) {
                     Image(systemName: "calendar")
                         .font(.system(size: 13, weight: .medium))
-                        .foregroundColor(.accentColor)
+                        .foregroundColor(DS.Color.brand)
                     Text("跳转到有记录的日期")
                         .font(.system(size: 14, weight: .semibold))
                     Spacer(minLength: 0)
@@ -378,13 +390,13 @@ struct ContentView: View {
                 .frame(maxHeight: 280)
             }
             .frame(width: 300, alignment: .leading)
-            .background(Color(nsColor: .controlBackgroundColor))
+            .background(DS.Color.surface)
             .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
             .overlay(
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .stroke(Color.secondary.opacity(0.2), lineWidth: 0.5)
+                    .stroke(DS.Color.border, lineWidth: 0.5)
             )
-            .shadow(color: Color.black.opacity(0.2), radius: 18, x: 0, y: 8)
+            .shadow(color: DS.Color.shadow, radius: 18, x: 0, y: 8)
             .transition(.scale(scale: 0.97).combined(with: .opacity))
         }
     }
@@ -400,11 +412,11 @@ struct ContentView: View {
             HStack(spacing: 8) {
                 Image(systemName: isCurrent ? "checkmark.circle.fill" : icon)
                     .font(.system(size: 12))
-                    .foregroundColor(isCurrent ? Color.accentColor : Color.secondary)
+                    .foregroundColor(isCurrent ? DS.Color.brand : Color.secondary)
                     .frame(width: 16)
                 Text(title)
                     .font(.system(size: 13, weight: isCurrent ? .semibold : .regular))
-                    .foregroundColor(isCurrent ? Color.accentColor : Color.primary)
+                    .foregroundColor(isCurrent ? DS.Color.brand : Color.primary)
                 Spacer(minLength: 8)
                 Text(detail)
                     .font(.caption2)
@@ -416,7 +428,7 @@ struct ContentView: View {
             .contentShape(Rectangle())
             .background(
                 RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .fill(isCurrent ? Color.accentColor.opacity(0.08) : Color.clear)
+                    .fill(isCurrent ? DS.Color.surfaceSelected : Color.clear)
             )
         }
         .buttonStyle(.plain)
@@ -435,7 +447,7 @@ struct ContentView: View {
 
     private var discardDraftLayer: some View {
         ZStack {
-            Color.black.opacity(0.12)
+            DS.Color.scrim
                 .onTapGesture { discardNewDraft = false }
             DiscardDraftDialog(
                 onContinue: { discardNewDraft = false },
@@ -620,7 +632,7 @@ struct ContentView: View {
     private var resizeHandle: some View {
         Image(systemName: "arrow.up.left.and.arrow.down.right")
             .font(.system(size: 9, weight: .semibold))
-            .foregroundColor(Color.secondary.opacity(0.55))
+            .foregroundColor(DS.Color.textTertiary)
             .frame(width: 18, height: 18)
             .contentShape(Rectangle())
             .gesture(cornerResizeGesture)
@@ -987,21 +999,36 @@ struct ContentView: View {
             Button(action: { model.showClipboardHistory() }) {
                 Image(systemName: "doc.on.clipboard")
                     .font(.system(size: 12, weight: .medium))
+                    .frame(width: 22, height: 22)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .foregroundColor(.secondary)
+            .foregroundColor(DS.Color.textSecondary)
             .focusable(false)
             .help("剪切板历史（自动捕获的复制记录）")
+            .accessibilityLabel("剪切板历史")
+            .background(
+                GeometryReader { geo in
+                    Color.clear
+                        .onAppear { TitleBarLayout.rightButtonGroupMinX = geo.frame(in: .named("perchWindow")).minX }
+                        .onChange(of: geo.frame(in: .named("perchWindow"))) { frame in
+                            TitleBarLayout.rightButtonGroupMinX = frame.minX
+                        }
+                }
+            )
 
             // 标签云入口
             Button(action: { model.showTagCloud() }) {
                 Image(systemName: "tag")
                     .font(.system(size: 12, weight: .medium))
+                    .frame(width: 22, height: 22)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .foregroundColor(.secondary)
+            .foregroundColor(DS.Color.textSecondary)
             .focusable(false)
             .help("标签云（按数量排序，点击标签筛选记录）")
+            .accessibilityLabel("标签云")
 
             // 笔记首页入口：任意页面一键回到主列表（Cella 图标左侧）
             Button(action: { model.returnToList() }) {
@@ -1010,10 +1037,13 @@ struct ContentView: View {
                     .aspectRatio(contentMode: .fit)
                     .frame(width: 15, height: 15)
                     .cornerRadius(3)
+                    .frame(width: 22, height: 22)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .focusable(false)
             .help("回到笔记首页")
+            .accessibilityLabel("回到笔记首页")
 
             // Cella 应用入口（位置 2）
             Button(action: openCellaApp) {
@@ -1021,19 +1051,25 @@ struct ContentView: View {
                     .resizable()
                     .aspectRatio(contentMode: .fit)
                     .frame(width: 15, height: 15)
+                    .frame(width: 22, height: 22)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .focusable(false)
             .help("打开 Cella（层隅）")
+            .accessibilityLabel("打开 Cella")
 
             Button(action: { model.showSettings() }) {
                 Image(systemName: "gearshape")
                     .font(.system(size: 12))
+                    .frame(width: 22, height: 22)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .foregroundColor(.secondary)
+            .foregroundColor(DS.Color.textSecondary)
             .focusable(false)
             .help("设置（快捷键 / 数据 / 同步）")
+            .accessibilityLabel("设置")
 
             Button(action: openGitHub) {
                 Label("开源仓库", systemImage: "globe")
@@ -1067,11 +1103,11 @@ struct ContentView: View {
                 .frame(maxWidth: .infinity)
                 .background(
                     RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .fill(Color.secondary.opacity(0.07))
+                        .fill(DS.Color.surfaceAlt)
                 )
                 .overlay(
                     RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .stroke(Color.secondary.opacity(0.16), lineWidth: 0.5)
+                        .stroke(DS.Color.border, lineWidth: 0.5)
                 )
             }
             .buttonStyle(.plain)
@@ -1112,7 +1148,7 @@ struct ContentView: View {
         HStack(spacing: 8) {
             Image(systemName: "checkmark.circle")
                 .font(.system(size: 12, weight: .semibold))
-                .foregroundColor(.accentColor)
+                .foregroundColor(DS.Color.brand)
             Text("多选模式：点行首圆圈勾选记录")
                 .font(.system(size: 12))
                 .foregroundColor(.secondary)
@@ -1166,6 +1202,7 @@ struct ContentView: View {
     /// Cella 是 `LSUIElement` 应用，`activate` 不会让任何窗口出现，所以只能由 Cella
     /// 自己把面板弹出来 —— 双方约定用分布式通知 `com.cella.app.showPanel` 触发
     /// （Cella 侧在 `AppDelegate` 里监听同名通知）。
+    /// 通知里附带目标 frame：贴在 Perch 面板左侧，宽高与 Perch 保持一致。
     private func openCellaApp() {
         let ws = NSWorkspace.shared
         let bundleId = "com.cella.app"
@@ -1176,10 +1213,14 @@ struct ContentView: View {
         }
 
         let requestPanel = {
+            var info: [String: Any] = [:]
+            if let perchFrame = hostWindow?.frame {
+                info["frame"] = NSStringFromRect(cellaFrame(alongside: perchFrame))
+            }
             DistributedNotificationCenter.default().postNotificationName(
                 Notification.Name("com.cella.app.showPanel"),
                 object: nil,
-                userInfo: nil,
+                userInfo: info.isEmpty ? nil : info,
                 deliverImmediately: true
             )
         }
@@ -1202,6 +1243,23 @@ struct ContentView: View {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: requestPanel)
             }
         }
+    }
+
+    /// Cella 面板的目标位置：贴在本面板左侧（留 8pt 间隙），宽高与本面板一致。
+    /// 本面板贴近屏幕左缘时，把 Cella 收进可见区域，避免整窗跑出屏幕。
+    private func cellaFrame(alongside perchFrame: NSRect) -> NSRect {
+        let gap: CGFloat = 8
+        var x = perchFrame.minX - perchFrame.width - gap
+        let screen = NSScreen.screens.first { $0.visibleFrame.intersects(perchFrame) } ?? NSScreen.main
+        if let visible = screen?.visibleFrame {
+            x = max(x, visible.minX + gap)
+        }
+        return NSRect(
+            x: x,
+            y: perchFrame.minY,
+            width: perchFrame.width,
+            height: perchFrame.height
+        )
     }
 
     private func openGitHub() {
@@ -1281,7 +1339,7 @@ struct ContentView: View {
                                     .padding(.horizontal, 9)
                                     .padding(.vertical, 4)
                                     .background(
-                                        Capsule().fill(Color.accentColor.opacity(0.08))
+                                        Capsule().fill(DS.Color.brandSoft)
                                     )
                                 }
                                 .buttonStyle(.plain)
@@ -1300,7 +1358,7 @@ struct ContentView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color(nsColor: .windowBackgroundColor))
+        .background(DS.Color.background)
     }
 
     /// 点击某个标签后的结果页：该标签下的全部记录
@@ -1333,7 +1391,7 @@ struct ContentView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color(nsColor: .windowBackgroundColor))
+        .background(DS.Color.background)
     }
 
     private func tagResultRow(_ row: TreeRowVM) -> some View {
@@ -1358,7 +1416,7 @@ struct ContentView: View {
         .padding(.vertical, 7)
         .background(
             RoundedRectangle(cornerRadius: 6)
-                .fill(Color.secondary.opacity(0.05))
+                .fill(DS.Color.surfaceAlt)
         )
         .onTapGesture {
             model.openTreeFromTagResult(row.id)
@@ -1401,13 +1459,13 @@ struct ContentView: View {
 
     private func tagEditorLayer(_ target: TagEditorTarget) -> some View {
         ZStack {
-            Color.black.opacity(0.12)
+            DS.Color.scrim
                 .onTapGesture { tagEditorTarget = nil }
             VStack(alignment: .leading, spacing: 10) {
                 HStack(spacing: 6) {
                     Image(systemName: "tag")
                         .font(.system(size: 12))
-                        .foregroundColor(.accentColor)
+                        .foregroundColor(DS.Color.brand)
                     Text(target.kind == .tree ? "编辑记录标签" : "编辑分段标签")
                         .font(.system(size: 14, weight: .semibold))
                     Spacer(minLength: 0)
@@ -1432,7 +1490,7 @@ struct ContentView: View {
             .padding(14)
             .background(
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(Color(nsColor: .windowBackgroundColor))
+                    .fill(DS.Color.background)
                     .shadow(color: .black.opacity(0.18), radius: 14, y: 4)
             )
             .padding(.horizontal, 28)
@@ -1689,10 +1747,10 @@ struct ContentView: View {
         if let t = model.lastToast {
             Text(t)
                 .font(.system(size: 12, weight: .medium))
-                .foregroundColor(.white)
+                .foregroundColor(DS.Color.textOnBrand)
                 .padding(.horizontal, 12)
                 .padding(.vertical, 7)
-                .background(Capsule().fill(Color.black.opacity(0.72)))
+                .background(Capsule().fill(DS.Color.toastBackground))
                 .padding(.bottom, 10)
                 .transition(.move(edge: .bottom).combined(with: .opacity))
         }
@@ -1740,7 +1798,7 @@ struct ContentView: View {
                         HStack(spacing: 6) {
                             Image(systemName: "checkmark.circle.fill")
                                 .font(.system(size: 11))
-                                .foregroundColor(.accentColor)
+                                .foregroundColor(DS.Color.brand)
                             Text("找到 \(model.searchResults.count) 条匹配结果")
                                 .font(.caption)
                                 .foregroundColor(.secondary)
@@ -1758,7 +1816,7 @@ struct ContentView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color(nsColor: .windowBackgroundColor))
+        .background(DS.Color.background)
         .onAppear { searchFieldFocused = true }
     }
 
@@ -1937,7 +1995,7 @@ struct ContentView: View {
             }
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color(nsColor: .windowBackgroundColor))
+        .background(DS.Color.background)
     }
 
     // MARK: - 剪切板历史
@@ -1990,7 +2048,7 @@ struct ContentView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color(nsColor: .windowBackgroundColor))
+        .background(DS.Color.background)
     }
 
     /// 剪贴板历史底栏：按时间区间（天）翻页，中心按钮弹出日期跳转目录
@@ -2050,9 +2108,12 @@ struct ContentView: View {
             Text("剪切板历史")
                 .font(.system(size: 14, weight: .semibold))
             Spacer(minLength: 0)
-            Text("共 \(model.clipboardHistoryTotal) 条")
+            Text(model.clipboardHistoryTotal > model.clipboardListedCount
+                 ? "共 \(model.clipboardHistoryTotal) 条 · 显示最近 \(model.clipboardListedCount) 条"
+                 : "共 \(model.clipboardHistoryTotal) 条")
                 .font(.caption)
                 .foregroundColor(.secondary)
+                .help("列表按内容去重，只展示最近 \(Config.clipboardRecentLimit) 条；更早的记录仍可通过搜索找到")
             if model.clipboardHistoryTotal > 0 {
                 Button("清空", role: .destructive) {
                     requestDelete(
@@ -2078,20 +2139,21 @@ struct ContentView: View {
     }
 
     private func clipboardHistoryRow(_ item: ClipboardHistoryItem) -> some View {
-        HStack(alignment: .top, spacing: 8) {
+        let isHovered = hoveredClipboardItemID == item.id
+        return HStack(alignment: .top, spacing: 8) {
             VStack(alignment: .leading, spacing: 2) {
                 if item.isImage {
                     HStack(spacing: 4) {
                         Image(systemName: "photo")
                             .font(.system(size: 10))
                             .foregroundColor(.secondary)
-                        Text(item.content)
+                        Text(item.previewText)
                             .font(.system(size: 12))
                             .lineLimit(1)
                             .truncationMode(.tail)
                     }
                 } else {
-                    Text(item.content)
+                    Text(item.previewText)
                         .font(.system(size: 12))
                         .lineLimit(2)
                         .truncationMode(.tail)
@@ -2126,10 +2188,36 @@ struct ContentView: View {
             .foregroundColor(.secondary)
             .help("复制该条记录")
             .padding(.top, 2)
+
+            // 单条删除：仅悬停该行时出现，点击即删（不弹确认）
+            Button {
+                hoveredClipboardItemID = nil
+                model.deleteClipboardItemImmediately(item)
+            } label: {
+                Image(systemName: "trash")
+                    .font(.system(size: 11))
+                    .frame(width: 18, height: 18)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .focusable(false)
+            .foregroundColor(DS.Color.danger)
+            .opacity(isHovered ? 1 : 0)
+            .allowsHitTesting(isHovered)
+            .help("删除这条记录（不弹确认）")
+            .accessibilityLabel("删除这条剪切板记录")
+            .padding(.top, 1)
         }
         .padding(.vertical, 5)
         .padding(.horizontal, 8)
         .contentShape(Rectangle())
+        .onHover { inside in
+            if inside {
+                hoveredClipboardItemID = item.id
+            } else if hoveredClipboardItemID == item.id {
+                hoveredClipboardItemID = nil
+            }
+        }
         .onTapGesture {
             model.copyClipboardItem(item)
         }
@@ -2163,7 +2251,7 @@ private struct DiscardDraftDialog: View {
             HStack(spacing: 6) {
                 Image(systemName: "exclamationmark.triangle")
                     .font(.system(size: 13, weight: .medium))
-                    .foregroundColor(.orange)
+                    .foregroundColor(DS.Color.warning)
                 Text("放弃未保存的内容？")
                     .font(.system(size: 14, weight: .semibold))
             }
@@ -2180,19 +2268,19 @@ private struct DiscardDraftDialog: View {
                     .keyboardShortcut(.cancelAction)
                 Button("放弃草稿", role: .destructive, action: onDiscard)
                     .buttonStyle(.borderedProminent)
-                    .tint(.red)
+                    .tint(DS.Color.danger)
             }
             .padding(.top, 6)
         }
         .padding(16)
         .frame(width: 320, alignment: .leading)
-        .background(Color(nsColor: .controlBackgroundColor))
+        .background(DS.Color.surface)
         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .stroke(Color.secondary.opacity(0.2), lineWidth: 0.5)
+                .stroke(DS.Color.border, lineWidth: 0.5)
         )
-        .shadow(color: Color.black.opacity(0.2), radius: 18, x: 0, y: 8)
+        .shadow(color: DS.Color.shadow, radius: 18, x: 0, y: 8)
         .scaleEffect(appeared ? 1 : 0.94)
         .opacity(appeared ? 1 : 0)
         .onAppear { appeared = true }
@@ -2225,7 +2313,7 @@ private struct DeleteConfirmDialog: View {
             HStack(spacing: 6) {
                 Image(systemName: "trash")
                     .font(.system(size: 13, weight: .medium))
-                    .foregroundColor(.red)
+                    .foregroundColor(DS.Color.danger)
                 Text(titleText)
                     .font(.system(size: 14, weight: .semibold))
             }
@@ -2242,19 +2330,19 @@ private struct DeleteConfirmDialog: View {
                     .keyboardShortcut(.cancelAction)
                 Button("删除", role: .destructive, action: onConfirm)
                     .buttonStyle(.borderedProminent)
-                    .tint(.red)
+                    .tint(DS.Color.danger)
             }
             .padding(.top, 6)
         }
         .padding(16)
         .frame(width: 300, alignment: .leading)
-        .background(Color(nsColor: .controlBackgroundColor))
+        .background(DS.Color.surface)
         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .stroke(Color.secondary.opacity(0.2), lineWidth: 0.5)
+                .stroke(DS.Color.border, lineWidth: 0.5)
         )
-        .shadow(color: Color.black.opacity(0.2), radius: 18, x: 0, y: 8)
+        .shadow(color: DS.Color.shadow, radius: 18, x: 0, y: 8)
         .scaleEffect(appeared ? 1 : 0.94)
         .opacity(appeared ? 1 : 0)
         .onAppear { appeared = true }
@@ -2327,13 +2415,13 @@ private struct HoverCard: View {
         }
         .padding(8)
         .frame(width: cardW, height: cardH, alignment: .topLeading)
-        .background(Color(nsColor: .controlBackgroundColor))
+        .background(DS.Color.surface)
         .cornerRadius(8)
         .overlay(
             RoundedRectangle(cornerRadius: 8)
-                .stroke(Color.secondary.opacity(0.2), lineWidth: 0.5)
+                .stroke(DS.Color.border, lineWidth: 0.5)
         )
-        .shadow(color: Color.black.opacity(0.18), radius: 8, x: 0, y: 4)
+        .shadow(color: DS.Color.shadow, radius: 8, x: 0, y: 4)
         .offset(x: x, y: showBelow ? belowY : aboveY)
         .allowsHitTesting(false)
     }
@@ -2386,7 +2474,7 @@ private struct TreeRowView: View {
                     Button(action: onToggleSelect) {
                         Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
                             .font(.system(size: 13, weight: .semibold))
-                            .foregroundColor(isSelected ? Color.accentColor : Color.secondary)
+                            .foregroundColor(isSelected ? DS.Color.brand : Color.secondary)
                             .frame(width: 15)
                     }
                     .buttonStyle(.plain)
@@ -2451,7 +2539,7 @@ private struct TreeRowView: View {
                         }
                         .buttonStyle(.plain)
                         .focusable(false)
-                        .foregroundColor(row.tree.isArchived ? .accentColor : .secondary)
+                        .foregroundColor(row.tree.isArchived ? DS.Color.brand : .secondary)
                         .help(row.tree.isArchived ? "取消归档（快捷键 X）" : "归档（快捷键 X）")
 
                         Button(action: onDeleteTree) {
@@ -2484,7 +2572,7 @@ private struct TreeRowView: View {
             .overlay(
                 RoundedRectangle(cornerRadius: 6)
                     .stroke(
-                        isKeyboardSelected ? Color.accentColor.opacity(0.6) : Color.clear,
+                        isKeyboardSelected ? DS.Color.focusRing : Color.clear,
                         lineWidth: 1
                     )
             )
@@ -2516,9 +2604,9 @@ private struct TreeRowView: View {
 
     /// 行底色：多选已勾选 > 键盘选中 > 鼠标悬停 > 无状态
     private var rowBackgroundColor: Color {
-        if isMultiSelecting, isSelected { return Color.accentColor.opacity(0.16) }
-        if isKeyboardSelected { return Color.accentColor.opacity(0.16) }
-        if isHovered { return Color.accentColor.opacity(0.10) }
+        if isMultiSelecting, isSelected { return DS.Color.surfaceSelected }
+        if isKeyboardSelected { return DS.Color.surfaceSelected }
+        if isHovered { return DS.Color.surfaceHover }
         return Color.clear
     }
 
@@ -2577,7 +2665,7 @@ private struct TreeRowView: View {
         return HStack(alignment: .top, spacing: 6) {
             HStack(alignment: .top, spacing: 6) {
                 Circle()
-                    .fill(Color.accentColor.opacity(0.55))
+                    .fill(DS.Color.accent.opacity(0.7))
                     .frame(width: 5, height: 5)
                     .padding(.top, 7)
                 VStack(alignment: .leading, spacing: 2) {
@@ -2625,7 +2713,7 @@ private struct TreeRowView: View {
         .padding(.horizontal, 8)
         .background(
             RoundedRectangle(cornerRadius: 5)
-                .fill(highlighted ? Color.accentColor.opacity(0.25) : (hov ? Color.accentColor.opacity(0.08) : Color.clear))
+                .fill(highlighted ? DS.Color.surfaceSelected : (hov ? DS.Color.surfaceHover : Color.clear))
         )
         .background(chunkHoverGeometry(for: c, hovered: hov))
         .onHover { hov in onChunkHover(c.id, hov) }
@@ -2709,11 +2797,11 @@ private func tagChips(_ tags: [String], compact: Bool) -> some View {
     return HStack(spacing: 3) {
         ForEach(Array(shown), id: \.self) { name in
             Text(name)
-                .font(.system(size: 9))
-                .foregroundColor(.accentColor)
+                .font(.system(size: 10, weight: .medium))
+                .foregroundColor(DS.Color.tagText)
                 .padding(.horizontal, 5)
                 .padding(.vertical, 1)
-                .background(Capsule().fill(Color.accentColor.opacity(0.10)))
+                .background(Capsule().fill(DS.Color.tagBackground))
                 .lineLimit(1)
         }
         if tags.count > shown.count {

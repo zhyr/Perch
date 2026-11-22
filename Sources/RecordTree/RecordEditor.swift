@@ -115,7 +115,7 @@ struct RecordEditor: View {
 
             Spacer()
         }
-        .background(Color(nsColor: .windowBackgroundColor))
+        .background(DS.Color.background)
         .onAppear {
             // 新建时自动聚焦标题；编辑时保持原样，避免抢占光标打扰用户
             guard mode == .new else { return }

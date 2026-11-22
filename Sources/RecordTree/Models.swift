@@ -71,4 +71,11 @@ struct ClipboardHistoryItem: Identifiable {
     let lastCopiedMs: Int64?
 
     var isImage: Bool { !attachment.isEmpty }
+
+    /// 去重键：文本按内容，图片按附件路径（不同图片尺寸/字节数可能拼出同一段说明文字）
+    var dedupeKey: String { attachment.isEmpty ? content : attachment }
+
+    /// 列表行展示用文本：只取开头一段，避免把数 MB 的原文交给 Text 布局。
+    /// 复制 / 归档仍使用完整 content。
+    var previewText: String { String(content.prefix(800)) }
 }

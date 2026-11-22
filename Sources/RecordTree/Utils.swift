@@ -9,6 +9,9 @@ enum Config {
     static let minCaptureTextLen = 5
     /// 每屏最大条数
     static let pageSize = 10
+    /// 剪切板历史列表展示上限（按内容去重后的最近条数）。
+    /// 库里的历史一条都不删，只是不在列表中展示；更早的记录仍可被搜索命中。
+    static let clipboardRecentLimit = 99
     /// 窗口可调最小尺寸
     static let panelMinWidth: CGFloat = 380
     static let panelMinHeight: CGFloat = 492

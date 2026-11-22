@@ -10,6 +10,8 @@ struct SettingsView: View {
     let onRequestClearAll: () -> Void
     @State private var isRecording = false
     @State private var eventMonitor: Any?
+    /// 外观三态：跟随系统 / 浅色 / 深色
+    @AppStorage(AppearanceStore.key) private var appearanceMode = AppearanceMode.system.rawValue
 
     // AI 打标签配置（键与 AppModel.AIConfigKey 保持一致）
     @AppStorage(AppModel.AIConfigKey.provider) private var aiProvider = 0
@@ -45,7 +47,7 @@ struct SettingsView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color(nsColor: .windowBackgroundColor))
+        .background(DS.Color.background)
         .task { cloudKey = AppModel.cloudAPIKey() }
         .onChange(of: cloudKey) { newValue in
             // 400ms 防抖，避免每敲一个字符就写一次钥匙串
@@ -117,7 +119,7 @@ struct SettingsView: View {
                             .controlSize(.small)
                         Text("监听中")
                             .font(.caption)
-                            .foregroundColor(.accentColor)
+                            .foregroundColor(DS.Color.brand)
                     } else {
                         Text("更改")
                             .font(.system(size: 12))
@@ -129,13 +131,13 @@ struct SettingsView: View {
                 .background(
                     RoundedRectangle(cornerRadius: 7, style: .continuous)
                         .fill(isRecording
-                              ? Color.accentColor.opacity(0.12)
-                              : Color.secondary.opacity(0.08))
+                              ? DS.Color.brandSoft
+                              : DS.Color.surfaceAlt)
                 )
                 .overlay(
                     RoundedRectangle(cornerRadius: 7, style: .continuous)
                         .stroke(isRecording
-                                ? Color.accentColor.opacity(0.4)
+                                ? DS.Color.focusRing.opacity(0.6)
                                 : Color.clear, lineWidth: 1)
                 )
                 .contentShape(Rectangle())
@@ -188,7 +190,7 @@ struct SettingsView: View {
             .padding(.vertical, 8)
             .background(
                 RoundedRectangle(cornerRadius: 7, style: .continuous)
-                    .fill(Color.secondary.opacity(0.08))
+                    .fill(DS.Color.surfaceAlt)
             )
 
             HStack(spacing: 10) {
@@ -224,7 +226,7 @@ struct SettingsView: View {
             .padding(.vertical, 8)
             .background(
                 RoundedRectangle(cornerRadius: 7, style: .continuous)
-                    .fill(Color.secondary.opacity(0.08))
+                    .fill(DS.Color.surfaceAlt)
             )
         }
     }
@@ -238,10 +240,50 @@ struct SettingsView: View {
 
     // MARK: - 通用
 
+    /// 外观三态。切换后立即写入 UserDefaults 并应用到 NSApp，
+    /// 所有 DS 语义色会随 NSAppearance 重新解析，无需重启。
+    private var appearanceRow: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "circle.lefthalf.filled")
+                .font(.system(size: 12))
+                .foregroundColor(DS.Color.textSecondary)
+                .frame(width: 16)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("外观")
+                    .font(.system(size: 13))
+                Text("浅色 / 深色 / 跟随系统，立即生效")
+                    .font(.caption)
+                    .foregroundColor(DS.Color.textSecondary)
+            }
+
+            Spacer(minLength: 8)
+
+            Picker("", selection: $appearanceMode) {
+                ForEach(AppearanceMode.allCases) { mode in
+                    Text(mode.title).tag(mode.rawValue)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(width: 210)
+            .onChange(of: appearanceMode) { newValue in
+                AppearanceStore.set(AppearanceMode(rawValue: newValue) ?? .system)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .fill(DS.Color.surfaceAlt)
+        )
+    }
+
     private var generalSection: some View {
         VStack(alignment: .leading, spacing: 8) {
             sectionHeader("通用")
 
+            appearanceRow
 
             HStack(spacing: 10) {
                 Image(systemName: "exclamationmark.triangle")
@@ -276,19 +318,19 @@ struct SettingsView: View {
             .padding(.vertical, 8)
             .background(
                 RoundedRectangle(cornerRadius: 7, style: .continuous)
-                    .fill(Color.secondary.opacity(0.08))
+                    .fill(DS.Color.surfaceAlt)
             )
 
             HStack(spacing: 10) {
                 Image(systemName: "trash.slash")
                     .font(.system(size: 12))
-                    .foregroundColor(.red)
+                    .foregroundColor(DS.Color.danger)
                     .frame(width: 16)
 
                 VStack(alignment: .leading, spacing: 2) {
                     Text("清空全部记录")
                         .font(.system(size: 13))
-                        .foregroundColor(.red)
+                        .foregroundColor(DS.Color.danger)
                     Text("删除所有记录与分段，此操作不可恢复")
                         .font(.caption)
                         .foregroundColor(.secondary)
@@ -303,7 +345,7 @@ struct SettingsView: View {
             .padding(.vertical, 8)
             .background(
                 RoundedRectangle(cornerRadius: 7, style: .continuous)
-                    .fill(Color.red.opacity(0.07))
+                    .fill(DS.Color.dangerSoft)
             )
         }
     }
@@ -334,7 +376,7 @@ struct SettingsView: View {
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 8)
-            .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(Color.secondary.opacity(0.08)))
+            .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(DS.Color.surfaceAlt))
 
             // 当前预设的字段
             Group {
@@ -388,7 +430,7 @@ struct SettingsView: View {
             if let result = aiTestResult {
                 Text(result)
                     .font(.caption)
-                    .foregroundColor(result.contains("失败") ? .red : .secondary)
+                    .foregroundColor(result.contains("失败") ? DS.Color.danger : DS.Color.textSecondary)
                     .lineLimit(2)
                     .truncationMode(.tail)
             }
@@ -413,7 +455,7 @@ struct SettingsView: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
-        .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(Color.secondary.opacity(0.08)))
+        .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(DS.Color.surfaceAlt))
     }
 
     private func testAIConnection() {
@@ -462,7 +504,7 @@ struct SettingsView: View {
             .padding(.vertical, 8)
             .background(
                 RoundedRectangle(cornerRadius: 7, style: .continuous)
-                    .fill(Color.secondary.opacity(0.08))
+                    .fill(DS.Color.surfaceAlt)
             )
 
             HStack(spacing: 8) {

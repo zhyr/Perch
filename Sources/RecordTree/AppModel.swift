@@ -87,6 +87,8 @@ struct PageUnit {
     let dayEndMs: Int64
     let dayCount: Int
     let offsetInDay: Int
+    /// 该屏第一条在「已去重列表」中的全局下标（列表最多 99 条，直接内存切片，不再回查数据库）
+    let globalOffset: Int
     let count: Int
     let pageNo: Int
     let pagesInDay: Int
@@ -154,9 +156,14 @@ final class AppModel: ObservableObject {
     @Published var overlayActive = false
     @Published var searchResults: [SearchResultVM] = []
 
-    // MARK: - 剪切板历史（按时间区间翻页）
+    // MARK: - 剪切板历史（按天分屏，列表只展示去重后的最近 99 条）
     @Published var clipboardHistoryItems: [ClipboardHistoryItem] = []
+    /// 库里剪贴板历史的总条数（全部保留，不删数据）
     @Published var clipboardHistoryTotal = 0
+    /// 当前列表实际展示的去重后条数（≤ Config.clipboardRecentLimit）
+    @Published var clipboardListedCount = 0
+    /// 去重后的最近列表（最多 99 条）；翻页只在这份数据里切片
+    private var clipboardRecentItems: [ClipboardHistoryItem] = []
     @Published var clipboardHasNewer = false
     @Published var clipboardHasOlder = false
     @Published var clipboardDayTitle = ""
@@ -255,6 +262,8 @@ final class AppModel: ObservableObject {
         AppPaths.restoreConfiguredRoot()
         store = try DataStore()
         reload()
+        // 启动后默认落在剪贴板历史；笔记视图仍可通过页面内「返回」进入
+        showClipboardHistory()
     }
 
     /// AI 云端默认迁移：旧默认（OpenAI / gpt-4o-mini）→ 阅粒 Yueli AI（freemodel）。
@@ -564,23 +573,27 @@ final class AppModel: ObservableObject {
     }
 
     /// 重建剪贴板历史的按天分桶分页结构。
+    /// 数据源 = 按内容去重后的最近 99 条（只按时间倒序取有限行，不再扫全表）。
     /// keepingDay：数据变化后希望停留的日期（不存在则回落到最新一屏）。
     /// keepingPageNo：希望停留的当天页码（0 基），不传则默认停留在该天第 1 屏。
     private func rebuildClipboardUnits(keepingDay keepDayKey: String?, keepingPageNo: Int = 0) {
         guard let store else { return }
-        let times: [Int64]
+        let items: [ClipboardHistoryItem]
         do {
-            times = try store.clipboardHistoryUpdatedMsDesc()
+            items = try store.fetchClipboardRecentUnique(limit: Config.clipboardRecentLimit)
         } catch {
             // 查询失败时保留当前列表。原先用 try? 得到空数组，界面会显示成“暂无历史”。
             NSLog("rebuildClipboardUnits error: \(error)")
             return
         }
-        clipboardHistoryTotal = times.count
+        clipboardRecentItems = items
+        clipboardListedCount = items.count
+        // 库里总条数用 COUNT 查询（不拉全量），列表只展示最近 99 条去重记录
+        clipboardHistoryTotal = (try? store.clipboardHistoryCount()) ?? items.count
 
         var buckets: [DayBucket] = []
-        for t in times {
-            let range = TimeUtil.dayRangeMs(t)
+        for item in items {
+            let range = TimeUtil.dayRangeMs(item.updatedAtMs)
             if var last = buckets.last, last.startMs == range.start {
                 last.count += 1
                 buckets[buckets.count - 1] = last
@@ -601,6 +614,7 @@ final class AppModel: ObservableObject {
         }
 
         var newUnits: [PageUnit] = []
+        var globalOffset = 0
         for b in buckets {
             let pages = max(1, (b.count + Config.pageSize - 1) / Config.pageSize)
             for p in 0..<pages {
@@ -613,12 +627,14 @@ final class AppModel: ObservableObject {
                         dayEndMs: b.endMs,
                         dayCount: b.count,
                         offsetInDay: off,
+                        globalOffset: globalOffset + off,
                         count: cnt,
                         pageNo: p,
                         pagesInDay: pages
                     )
                 )
             }
+            globalOffset += b.count
         }
         clipboardUnits = newUnits
 
@@ -653,7 +669,7 @@ final class AppModel: ObservableObject {
     }
 
     private func loadClipboardPage() {
-        guard let store, !clipboardUnits.isEmpty else {
+        guard !clipboardUnits.isEmpty, !clipboardRecentItems.isEmpty else {
             clipboardHistoryItems = []
             clipboardDayTitle = ""
             clipboardDayMetaText = ""
@@ -663,15 +679,13 @@ final class AppModel: ObservableObject {
             return
         }
         let u = clipboardUnits[clipboardCursor]
-        do {
-            clipboardHistoryItems = try store.fetchClipboardHistoryPage(
-                startMs: u.dayStartMs,
-                endMs: u.dayEndMs,
-                limit: u.count,
-                offset: u.offsetInDay
-            )
-        } catch {
-            NSLog("loadClipboardPage error: \(error)")
+        // 翻页只在已去重、已截断的 99 条里切片，不再回查数据库
+        let start = u.globalOffset
+        let end = min(start + u.count, clipboardRecentItems.count)
+        clipboardHistoryItems = start < end ? Array(clipboardRecentItems[start..<end]) : []
+        if clipboardHistoryItems.isEmpty {
+            clipboardHasNewer = clipboardCursor > 0
+            clipboardHasOlder = clipboardCursor < clipboardUnits.count - 1
             return
         }
         clipboardCurrentDayKey = u.dayKey
@@ -740,6 +754,35 @@ final class AppModel: ObservableObject {
             }
         } else {
             writeAndFlag(content: item.content, chunkID: item.id, feedback: "已复制")
+        }
+    }
+
+    /// 剪贴板历史：立即删除单条（不弹二次确认）。
+    /// 数据路径：DataStore.deleteChunk 会删掉该 chunk 及其标签、图片附件；
+    /// 若它是所在记录树里最后一个分段，空树（maintree 行与树级标签）一并清理。
+    /// 删除后重建去重列表，从更早的记录补足 99 条。
+    func deleteClipboardItemImmediately(_ item: ClipboardHistoryItem) {
+        guard let store else { return }
+        let keepDay = clipboardCurrentDayKey
+        let keepPage = clipboardUnits.indices.contains(clipboardCursor)
+            ? clipboardUnits[clipboardCursor].pageNo
+            : 0
+        do {
+            guard let info = try store.deleteChunk(item.id) else { return }
+            // 与其它删除入口一致：写事件日志、重写受影响日期的 Markdown 归档
+            archive(
+                info: info,
+                kind: "删除剪切板历史条目",
+                content: item.content,
+                source: AppInfo.zhName,
+                atMs: TimeUtil.msNow()
+            )
+            if highlightedChunkID == item.id { highlightedChunkID = nil }
+            rebuildClipboardUnits(keepingDay: keepDay, keepingPageNo: keepPage)
+            showToast("已删除")
+        } catch {
+            NSLog("deleteClipboardItemImmediately error: \(error)")
+            showToast("删除失败")
         }
     }
 
@@ -1614,8 +1657,16 @@ final class AppModel: ObservableObject {
         (try? store?.tagsForItem(itemType: "chunk", itemID: chunkID)) ?? []
     }
 
-    /// 从标签结果页定位到主列表
+    /// 从标签结果页定位到主列表。
+    /// 标签结果可能包含剪贴板历史记录，它们不在主列表里，无法定位，给出提示而不是静默跳转。
     func openTreeFromTagResult(_ treeID: String) {
+        guard let store,
+              let metas = try? store.allNoteTreeMetas(),
+              metas.contains(where: { $0.id == treeID })
+        else {
+            showToast("该记录属于剪切板历史，可用右键复制")
+            return
+        }
         viewMode = .list
         reload()
         revealTree(treeID, expand: false)

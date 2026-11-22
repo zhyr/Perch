@@ -35,6 +35,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        // 恢复用户选择的外观（跟随系统 / 浅色 / 深色）
+        AppearanceStore.apply()
         setupMainMenu()
         activityToken = ProcessInfo.processInfo.beginActivity(
             options: [.userInitiatedAllowingIdleSystemSleep],
@@ -198,14 +200,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// 标题行大约 34pt。左侧 56pt 留给红绿灯，右侧约 196pt 留给图标按钮。
+    /// 标题行大约 34pt。左侧 56pt 留给红绿灯；右边界取「剪切板历史」按钮的实时
+    /// 左边缘，避免硬编码宽度随按钮数量变化后把按钮点击误判为窗口拖动。
     private func isTitlebarDrag(_ event: NSEvent) -> Bool {
         guard event.window === panel, let content = panel.contentView else { return false }
         let p = event.locationInWindow
         let b = content.bounds
-        guard p.y >= b.maxY - 34, p.y <= b.maxY else { return false }
-        guard p.x >= 56, p.x <= b.maxX - 196 else { return false }
-        return true
+        guard p.y >= b.maxY - 34, p.y <= b.maxY, p.x >= 56 else { return false }
+        let rightLimit = TitleBarLayout.rightButtonGroupMinX.map { $0 - 4 } ?? (b.maxX - 196)
+        return p.x <= rightLimit
     }
 
     private func dragPanel(from event: NSEvent) {
@@ -257,7 +260,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func setupStatusItem() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         item.button?.image = Self.statusIcon()
-        item.button?.toolTip = AppInfo.zhName
         item.button?.target = self
         item.button?.action = #selector(statusClicked(_:))
         item.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
